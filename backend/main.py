@@ -29,7 +29,7 @@ DATABASE_PATH = APP_DIR / "upload_metadata.db"
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_PDF_PAGES = 100
 
-app = FastAPI(title="Document Library API")
+app = FastAPI(title="Document Intelligence API")
 logger = logging.getLogger("document-library")
 app.add_middleware(
     CORSMiddleware,
@@ -693,6 +693,17 @@ def _conversation(connection: sqlite3.Connection, conversation_id: str) -> sqlit
     return row
 
 
+class ChatCancelled(Exception):
+    pass
+
+
+def _turn_is_pending(connection: sqlite3.Connection, conversation_id: str, turn_id: str, attempt_id: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM chat_messages WHERE conversation_id=? AND turn_id=? AND role='user' AND status='pending' AND attempt_id=?",
+        (conversation_id, turn_id, attempt_id),
+    ).fetchone() is not None
+
+
 @app.post("/conversations", status_code=201)
 def create_conversation(payload: dict[str, object]) -> dict[str, object]:
     scope_mode = payload.get("scopeMode", "all")
@@ -739,7 +750,11 @@ def get_conversation(conversation_id: str) -> dict[str, object]:
     with closing(get_connection()) as connection:
         conversation = _conversation(connection, conversation_id)
         messages = connection.execute(
-            "SELECT * FROM chat_messages WHERE conversation_id=? ORDER BY created_at, id",
+            """SELECT m.* FROM chat_messages AS m
+            JOIN chat_messages AS u ON u.conversation_id=m.conversation_id
+              AND u.turn_id=m.turn_id AND u.role='user'
+            WHERE m.conversation_id=?
+            ORDER BY u.created_at, u.id, CASE m.role WHEN 'user' THEN 0 ELSE 1 END""",
             (conversation_id,),
         ).fetchall()
         return {**chat_history.conversation_payload(conversation), "messages": [chat_history.message_payload(row) for row in messages]}
@@ -770,13 +785,23 @@ def delete_conversation(conversation_id: str) -> Response:
 def stream_conversation_message(conversation_id: str, payload: dict[str, object]) -> StreamingResponse:
     question = payload.get("question")
     turn_id = payload.get("turnId") or chat_history.new_id()
+    attempt_id = payload.get("attemptId") or chat_history.new_id()
     if not isinstance(question, str) or not question.strip() or len(question) > 4000:
         raise HTTPException(status_code=400, detail="Question must be between 1 and 4000 characters.")
     if not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 100:
         raise HTTPException(status_code=400, detail="Invalid turn ID.")
+    if not isinstance(attempt_id, str) or not attempt_id.strip() or len(attempt_id) > 100:
+        raise HTTPException(status_code=400, detail="Invalid attempt ID.")
     question = question.strip()
     with closing(get_connection()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
         conversation = _conversation(connection, conversation_id)
+        pending = connection.execute(
+            "SELECT turn_id FROM chat_messages WHERE conversation_id=? AND role='user' AND status='pending'",
+            (conversation_id,),
+        ).fetchone()
+        if pending is not None:
+            raise HTTPException(status_code=409, detail="Another answer is already in progress in this chat.")
         existing = connection.execute(
             "SELECT * FROM chat_messages WHERE conversation_id=? AND turn_id=? AND role='user'",
             (conversation_id, turn_id),
@@ -792,11 +817,11 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
                 result = chat_history.message_payload(answer)
                 return StreamingResponse(iter([_sse("final", {"message": result, "conversation": chat_history.conversation_payload(conversation)})]), media_type="text/event-stream")
         if existing:
-            connection.execute("UPDATE chat_messages SET status='pending' WHERE id=?", (existing["id"],))
+            connection.execute("UPDATE chat_messages SET status='pending', attempt_id=? WHERE id=?", (attempt_id, existing["id"]))
         else:
             connection.execute(
-                "INSERT INTO chat_messages(id, conversation_id, turn_id, role, content, status, created_at) VALUES (?, ?, ?, 'user', ?, 'pending', ?)",
-                (chat_history.new_id(), conversation_id, turn_id, question, utc_now()),
+                "INSERT INTO chat_messages(id, conversation_id, turn_id, role, content, status, attempt_id, created_at) VALUES (?, ?, ?, 'user', ?, 'pending', ?, ?)",
+                (chat_history.new_id(), conversation_id, turn_id, question, attempt_id, utc_now()),
             )
         connection.commit()
         scope = chat_history.conversation_payload(conversation)
@@ -808,6 +833,8 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
             with closing(get_connection()) as connection:
                 current = _conversation(connection, conversation_id)
                 effective_question, context_trace = chat_history.context_and_question(connection, current, question)
+                if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
+                    raise ChatCancelled()
             yield _sse("status", {"stage": "retrieval", "label": "Finding document evidence"})
             ask_payload: dict[str, object] = {"question": effective_question}
             if scope["scopeMode"] == "customer":
@@ -816,18 +843,30 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
                 ask_payload["documentIds"] = scope["documentIds"]
             prepared, chunks, trace = _prepare_question(ask_payload, question)
             trace["conversationContext"] = context_trace
+            with closing(get_connection()) as connection:
+                if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
+                    raise ChatCancelled()
             yield _sse("status", {"stage": "answer", "label": "Writing answer"})
             if prepared is not None:
                 result = prepared
                 # Structured results are calculated and verified before they
                 # can be shown. RAG generation below streams actual model text.
                 for start in range(0, len(str(result["answer"])), 80):
+                    with closing(get_connection()) as connection:
+                        if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
+                            raise ChatCancelled()
                     yield _sse("delta", {"text": str(result["answer"])[start:start + 80]})
             else:
                 answer = ""
                 citations: list[str] = []
+                delta_count = 0
                 for item in rag.answer_stream(effective_question, chunks):
                     if item["type"] == "delta":
+                        delta_count += 1
+                        if delta_count % 15 == 0:
+                            with closing(get_connection()) as connection:
+                                if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
+                                    raise ChatCancelled()
                         yield _sse("delta", {"text": item["text"]})
                     elif item["type"] == "final":
                         answer = item["answer"]
@@ -837,13 +876,16 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
                 result = _finish_rag(answer, citations, chunks, trace)
             timestamp = utc_now()
             with closing(get_connection()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
+                    raise ChatCancelled()
                 connection.execute(
                     "INSERT OR REPLACE INTO chat_messages(id, conversation_id, turn_id, role, content, status, sources_json, mode, debug_json, created_at) VALUES (?, ?, ?, 'assistant', ?, 'completed', ?, ?, ?, ?)",
                     (chat_history.new_id(), conversation_id, turn_id, result["answer"], json.dumps(result["sources"]), result["mode"], json.dumps(result["debug"]), timestamp),
                 )
                 connection.execute(
-                    "UPDATE chat_messages SET status='completed' WHERE conversation_id=? AND turn_id=? AND role='user'",
-                    (conversation_id, turn_id),
+                    "UPDATE chat_messages SET status='completed' WHERE conversation_id=? AND turn_id=? AND role='user' AND attempt_id=?",
+                    (conversation_id, turn_id, attempt_id),
                 )
                 connection.execute(
                     "UPDATE conversations SET title=CASE WHEN title='New chat' THEN ? ELSE title END, updated_at=? WHERE id=?",
@@ -860,26 +902,46 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
         except GeneratorExit:
             raise
         except Exception as error:
-            logger.exception("Conversation turn failed")
+            if isinstance(error, ChatCancelled):
+                logger.info("Conversation turn was stopped")
+            elif isinstance(error, HTTPException):
+                logger.warning("Conversation turn rejected: %s", error.detail)
+            else:
+                logger.exception("Conversation turn failed")
             with closing(get_connection()) as connection:
                 connection.execute(
-                    "UPDATE chat_messages SET status='failed' WHERE conversation_id=? AND turn_id=? AND role='user'",
-                    (conversation_id, turn_id),
+                    "UPDATE chat_messages SET status='failed' WHERE conversation_id=? AND turn_id=? AND role='user' AND attempt_id=? AND status='pending'",
+                    (conversation_id, turn_id, attempt_id),
                 )
                 connection.commit()
             finished = True
-            detail = error.detail if isinstance(error, HTTPException) else str(error) if isinstance(error, RuntimeError) else "The question could not be answered."
+            detail = "Response stopped." if isinstance(error, ChatCancelled) else error.detail if isinstance(error, HTTPException) else str(error) if isinstance(error, RuntimeError) else "The question could not be answered."
             yield _sse("error", {"detail": detail})
         finally:
             if not finished:
                 with closing(get_connection()) as connection:
                     connection.execute(
-                        "UPDATE chat_messages SET status='interrupted' WHERE conversation_id=? AND turn_id=? AND role='user' AND status='pending'",
-                        (conversation_id, turn_id),
+                        "UPDATE chat_messages SET status='interrupted' WHERE conversation_id=? AND turn_id=? AND role='user' AND attempt_id=? AND status='pending'",
+                        (conversation_id, turn_id, attempt_id),
                     )
                     connection.commit()
 
     return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/conversations/{conversation_id}/turns/{turn_id}/cancel")
+def cancel_conversation_turn(conversation_id: str, turn_id: str, payload: dict[str, object]) -> dict[str, str]:
+    attempt_id = payload.get("attemptId")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        raise HTTPException(status_code=400, detail="An attempt ID is required.")
+    with closing(get_connection()) as connection:
+        _conversation(connection, conversation_id)
+        cursor = connection.execute(
+            "UPDATE chat_messages SET status='interrupted' WHERE conversation_id=? AND turn_id=? AND role='user' AND status='pending' AND attempt_id=?",
+            (conversation_id, turn_id, attempt_id),
+        )
+        connection.commit()
+    return {"status": "interrupted" if cursor.rowcount else "unchanged"}
 
 
 @app.get("/uploads/{upload_id}/facts")

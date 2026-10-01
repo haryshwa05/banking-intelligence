@@ -2,17 +2,18 @@ import { CommonModule } from '@angular/common';
 import { HttpClient, HttpClientModule } from '@angular/common/http';
 import { Component, OnDestroy, OnInit } from '@angular/core';
 import { ChatComponent, Conversation } from './chat.component';
-import { DocumentRepositoryComponent } from './app.component';
+import { DocumentRepositoryComponent } from './document-repository.component';
+import { AppLogoComponent } from './app-logo.component';
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, HttpClientModule, ChatComponent, DocumentRepositoryComponent],
+  imports: [CommonModule, HttpClientModule, ChatComponent, DocumentRepositoryComponent, AppLogoComponent],
   template: `
     <div class="application-layout">
       <div *ngIf="sidebarOpen" class="sidebar-scrim" (click)="sidebarOpen = false"></div>
       <aside class="app-sidebar" [class.open]="sidebarOpen" aria-label="Main navigation">
-        <div class="sidebar-brand"><span class="product-mark">D</span><div><strong>Document Intelligence</strong><small>Local workspace</small></div></div>
+        <div class="sidebar-brand"><app-logo class="product-mark"></app-logo><div><strong>Document Intelligence</strong><small>Local workspace</small></div></div>
         <button class="new-chat-button" type="button" (click)="newChat()"><span>＋</span> New chat</button>
         <button class="sidebar-nav-item" type="button" [class.active]="view === 'repository'" (click)="openRepository()"><span class="sidebar-nav-icon">▣</span> Document Repository</button>
         <div class="sidebar-section-label">Recent chats</div>
@@ -28,8 +29,8 @@ import { DocumentRepositoryComponent } from './app.component';
       </aside>
 
       <main class="main-surface" [class.repository-view]="view === 'repository'">
-        <div class="mobile-bar"><button type="button" aria-label="Open menu" (click)="sidebarOpen = true">☰</button><span class="product-mark">D</span><strong>Document Intelligence</strong></div>
-        <app-chat *ngIf="view === 'chat'" [conversationId]="activeConversationId" (conversationChanged)="conversationChanged($event)" (sourceOpened)="openSource($event)"></app-chat>
+        <div class="mobile-bar"><button type="button" aria-label="Open menu" (click)="sidebarOpen = true">☰</button><app-logo class="product-mark"></app-logo><strong>Document Intelligence</strong></div>
+        <app-chat *ngIf="view === 'chat'" [conversationId]="activeConversationId" [displayTitle]="activeConversationTitle()" (conversationChanged)="conversationChanged($event)" (sourceOpened)="openSource($event)" (repositoryOpened)="openRepository()"></app-chat>
         <app-document-repository *ngIf="view === 'repository'" [previewDocumentId]="previewDocumentId"></app-document-repository>
       </main>
     </div>
@@ -58,6 +59,7 @@ export class AppShellComponent implements OnInit, OnDestroy {
     this.previewDocumentId = null;
   };
   private navigate(hash: string): void { window.location.hash = hash; this.onHashChange(); this.sidebarOpen = false; }
+  activeConversationTitle(): string | null { return this.conversations.find(item => item.id === this.activeConversationId)?.title || null; }
   newChat(): void { this.navigate('#/chat'); }
   openConversation(id: string): void { this.navigate(`#/chat/${id}`); }
   openRepository(): void { this.previewDocumentId = null; this.navigate('#/documents'); }

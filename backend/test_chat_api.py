@@ -84,6 +84,60 @@ class ChatApiTests(unittest.TestCase):
         self.assertEqual(len(self.client.get(f"/conversations/{conversation_id}").json()["messages"]), 2)
         self.assertEqual(self.client.post(f"/conversations/{conversation_id}/messages/stream", json={"question": "Different", "turnId": "same-turn"}).status_code, 409)
 
+    def test_customer_chat_never_falls_back_to_all_documents(self) -> None:
+        customer = self.client.post("/entities", json={"name": "Peter Parker"}).json()
+        with closing(main.get_connection()) as connection:
+            main.entities.assign_document(connection, "doc-one", customer["id"])
+            connection.commit()
+        conversation_id = self.client.post("/conversations", json={"scopeMode": "customer", "entityId": customer["id"]}).json()["id"]
+        scopes = []
+        with patch.object(main.facts, "answer_with_trace", side_effect=lambda _db, _question, ids: (scopes.append(ids) or None, {})), patch.object(
+            main.rag, "retrieve_with_trace", return_value=([], {})
+        ):
+            response = self.client.post(f"/conversations/{conversation_id}/messages/stream", json={"question": "What is his salary?"})
+        self.assertIn("event: final", response.text)
+        self.assertEqual(scopes, [["doc-one"]])
+
+    def test_deleted_scoped_document_fails_closed(self) -> None:
+        conversation_id = self.client.post("/conversations", json={"scopeMode": "documents", "documentIds": ["doc-one"]}).json()["id"]
+        with closing(main.get_connection()) as connection:
+            connection.execute("DELETE FROM uploads WHERE id='doc-one'")
+            connection.commit()
+        response = self.client.post(f"/conversations/{conversation_id}/messages/stream", json={"question": "What is in it?"})
+        self.assertIn("event: error", response.text)
+        self.assertNotIn("event: final", response.text)
+        detail = self.client.get(f"/conversations/{conversation_id}").json()
+        self.assertEqual(detail["messages"][0]["status"], "failed")
+
+    def test_rename_delete_and_pagination(self) -> None:
+        first = self.client.post("/conversations", json={"scopeMode": "all"}).json()
+        second = self.client.post("/conversations", json={"scopeMode": "all"}).json()
+        renamed = self.client.patch(f"/conversations/{first['id']}", json={"title": "Income review"})
+        self.assertEqual(renamed.json()["title"], "Income review")
+        self.assertEqual(len(self.client.get("/conversations?limit=1&offset=0").json()), 1)
+        self.assertEqual(len(self.client.get("/conversations?limit=1&offset=1").json()), 1)
+        self.assertEqual(self.client.delete(f"/conversations/{second['id']}").status_code, 204)
+        self.assertEqual(self.client.get(f"/conversations/{second['id']}").status_code, 404)
+
+    def test_cancel_is_attempt_scoped_and_retryable(self) -> None:
+        conversation_id = self.client.post("/conversations", json={"scopeMode": "all"}).json()["id"]
+        with closing(main.get_connection()) as connection:
+            connection.execute(
+                "INSERT INTO chat_messages(id, conversation_id, turn_id, role, content, status, attempt_id, created_at) VALUES ('u1', ?, 'turn-1', 'user', 'Question', 'pending', 'old-attempt', '2026-01-01')",
+                (conversation_id,),
+            )
+            connection.commit()
+        wrong = self.client.post(f"/conversations/{conversation_id}/turns/turn-1/cancel", json={"attemptId": "other"})
+        self.assertEqual(wrong.json()["status"], "unchanged")
+        stopped = self.client.post(f"/conversations/{conversation_id}/turns/turn-1/cancel", json={"attemptId": "old-attempt"})
+        self.assertEqual(stopped.json()["status"], "interrupted")
+        with patch.object(main.facts, "answer_with_trace", return_value=(("Verified answer", []), {})):
+            retry = self.client.post(f"/conversations/{conversation_id}/messages/stream", json={"question": "Question", "turnId": "turn-1", "attemptId": "new-attempt"})
+        self.assertIn("event: final", retry.text)
+        stale = self.client.post(f"/conversations/{conversation_id}/turns/turn-1/cancel", json={"attemptId": "old-attempt"})
+        self.assertEqual(stale.json()["status"], "unchanged")
+        self.assertEqual(self.client.get(f"/conversations/{conversation_id}").json()["messages"][0]["status"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

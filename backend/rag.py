@@ -285,22 +285,23 @@ class RagEngine:
 
         answer_match = re.search(r"<answer>(.*?)</answer>", raw, re.DOTALL)
         citations_match = re.search(r"<citations>(.*?)</citations>", raw, re.DOTALL)
-        if not answer_match or not citations_match:
-            yield {"type": "final", "answer": "I could not verify an answer against the selected evidence.", "citedChunkIds": []}
-            return
-        answer = answer_match.group(1).strip()
+        answer = answer_match.group(1).strip() if answer_match else ""
         try:
-            raw_ids = json.loads(citations_match.group(1).strip())
+            raw_ids = json.loads(citations_match.group(1).strip()) if citations_match else None
         except json.JSONDecodeError:
             raw_ids = None
-        if not answer or not isinstance(raw_ids, list):
-            yield {"type": "final", "answer": "I could not verify an answer against the selected evidence.", "citedChunkIds": []}
-            return
         allowed = {row["id"] for row in chunks}
-        citations = list(dict.fromkeys(item for item in raw_ids if isinstance(item, str) and item in allowed))
-        if not citations:
-            yield {"type": "final", "answer": "I could not verify an answer against the selected evidence.", "citedChunkIds": []}
-            return
+        citations = list(dict.fromkeys(item for item in raw_ids if isinstance(item, str) and item in allowed)) if isinstance(raw_ids, list) else []
+        if not answer or not citations:
+            # Recover from formatting failures with the existing tool-schema
+            # evidence contract. This extra request happens only on failure.
+            try:
+                answer, citations = self.answer(question, chunks)
+                citations = [item for item in citations if item in allowed]
+            except Exception:
+                citations = []
+            if not citations:
+                answer = "I could not verify an answer against the selected evidence."
         yield {"type": "final", "answer": answer, "citedChunkIds": citations}
 
     @staticmethod

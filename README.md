@@ -1,4 +1,4 @@
-# Document Library
+# Document Intelligence
 
 Upload images, PDFs, and common office documents from the Angular app. Files are saved locally under `backend/uploads/`, while their names, MIME types, sizes, upload times, and extraction status are stored in a local SQLite database.
 
@@ -36,19 +36,23 @@ npm install
 npm start
 ```
 
-Open `http://localhost:4200/` to upload and browse documents. Select a file to see its extraction progress and read completed text. In document details, assign a file that needs ownership review to an existing customer, or create a customer and assign it. Use **Ask your documents** after indexing finishes. Choose automatic scope (the full library, narrowed when a customer name resolves), one customer's linked documents, or one or more selected documents. A selected scope is enforced by the API for both structured facts and RAG retrieval.
+Open `http://localhost:4200/`. The sidebar separates Chat from the Document Repository. The repository retains upload, preview, extraction, ownership review, and deletion. In a new chat, choose automatic scope (the full library, narrowed when a customer name resolves), one customer, or selected documents. The scope is fixed for that conversation; start a new chat to change it. The API enforces it for both structured facts and RAG retrieval.
+
+Chats and messages are stored in the same local SQLite database as document metadata. Answers stream over `POST /conversations/{id}/messages/stream`: progress appears during context resolution and retrieval, RAG answer text streams as Claude generates it, and the final event supplies validated citations and developer trace. Structured calculations are verified before their answer text is delivered. Stop interrupts the current attempt, which can be retried without duplicating the user turn. A follow-up uses recent turns and a bounded summary to form a standalone retrieval question, but old chat answers are never treated as document evidence. Chats can be renamed or deleted from the sidebar.
+
+This is still a single-user local prototype with no login or per-user isolation. Add authentication and authorization before using it as a shared service for real customer data.
 
 Customer assignments are explicit reviewer choices. They update document ownership without treating every identifier in that document as a verified identifier for the chosen customer. Reassigning a document removes identifier evidence previously attributed to its former customer.
 
 ## Developer trace
 
-Every question response currently includes an expanded **Developer trace** panel in the Angular UI. It is intentionally for local development only and includes document text excerpts. It shows the searchable terms, vector and SQLite full-text candidates, fused ranks, reranker scores/cutoff decisions, selected structured facts, the calculation/selection plan, the RAG passages sent to Claude, and the final validated citation IDs.
+Completed answers have a collapsed **Show developer trace** control. It is intentionally for local development only and includes document text excerpts. It shows the searchable terms, vector and SQLite full-text candidates, fused ranks, reranker scores/cutoff decisions, selected structured facts, the calculation/selection plan, the RAG passages sent to Claude, and the final validated citation IDs.
 
 ## Verification
 
 ```powershell
 cd backend
-.\.venv\Scripts\python.exe -m unittest test_facts.py test_entity_resolution.py test_scope_api.py
+.\.venv\Scripts\python.exe -m unittest test_facts.py test_entity_resolution.py test_scope_api.py test_chat_api.py test_rag_stream.py
 
 cd ..\frontend
 npm run build
