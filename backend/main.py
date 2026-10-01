@@ -10,7 +10,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from dotenv import load_dotenv
@@ -22,7 +22,9 @@ from extraction import TextExtractor
 from entity_resolution import EntityResolver
 from facts import FactEngine
 from rag import RagEngine
+import agents
 import chat_history
+import knowledge
 
 UPLOADS_DIR = APP_DIR / "uploads"
 DATABASE_PATH = APP_DIR / "upload_metadata.db"
@@ -102,6 +104,8 @@ def initialise_storage() -> None:
         facts.initialise(connection)
         entities.initialise(connection)
         chat_history.initialise(connection)
+        knowledge.initialise(connection)
+        agents.initialise(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS extractions (
@@ -138,7 +142,8 @@ def initialise_storage() -> None:
         connection.execute(
             """INSERT OR IGNORE INTO document_entity_links(document_id, entity_id, status, confidence, reason, resolved_at)
             SELECT document_facts.upload_id, NULL, 'queued', NULL, NULL, NULL
-            FROM document_facts WHERE document_facts.status='ready'"""
+            FROM document_facts WHERE document_facts.status='ready'
+              AND NOT EXISTS (SELECT 1 FROM document_spaces WHERE document_spaces.document_id=document_facts.upload_id)"""
         )
         connection.commit()
 
@@ -179,23 +184,30 @@ def document_payload(row: sqlite3.Row) -> dict[str, str | int | None]:
         "entityName": row["entity_name"] if "entity_name" in row.keys() else None,
         "entityStatus": row["entity_status"] if "entity_status" in row.keys() else None,
         "entityReason": row["entity_reason"] if "entity_reason" in row.keys() else None,
+        "knowledgeKind": (row["space_kind"] if "space_kind" in row.keys() else None) or knowledge.ENTITY,
+        "spaceId": row["space_id"] if "space_id" in row.keys() else None,
+        "spaceName": row["space_name"] if "space_name" in row.keys() else None,
     }
+
+
+DOCUMENT_SELECT = """
+    SELECT uploads.*, extractions.status AS extraction_status, document_indexes.status AS index_status, document_facts.status AS fact_status,
+           document_entity_links.entity_id, document_entity_links.status AS entity_status,
+           document_entity_links.reason AS entity_reason, entities.display_name AS entity_name,
+           knowledge_spaces.id AS space_id, knowledge_spaces.name AS space_name, knowledge_spaces.kind AS space_kind
+    FROM uploads JOIN extractions ON extractions.upload_id = uploads.id
+    LEFT JOIN document_indexes ON document_indexes.upload_id = uploads.id
+    LEFT JOIN document_facts ON document_facts.upload_id = uploads.id
+    LEFT JOIN document_entity_links ON document_entity_links.document_id = uploads.id
+    LEFT JOIN entities ON entities.id = document_entity_links.entity_id
+    LEFT JOIN document_spaces ON document_spaces.document_id = uploads.id
+    LEFT JOIN knowledge_spaces ON knowledge_spaces.id = document_spaces.space_id
+"""
 
 
 def get_upload(upload_id: str) -> sqlite3.Row:
     with closing(get_connection()) as connection:
-        row = connection.execute(
-            """
-            SELECT uploads.*, extractions.status AS extraction_status, document_indexes.status AS index_status, document_facts.status AS fact_status,
-                   document_entity_links.entity_id, document_entity_links.status AS entity_status,
-                   document_entity_links.reason AS entity_reason, entities.display_name AS entity_name
-            FROM uploads JOIN extractions ON extractions.upload_id = uploads.id
-            LEFT JOIN document_indexes ON document_indexes.upload_id = uploads.id
-            LEFT JOIN document_facts ON document_facts.upload_id = uploads.id
-            LEFT JOIN document_entity_links ON document_entity_links.document_id = uploads.id
-            LEFT JOIN entities ON entities.id = document_entity_links.entity_id WHERE uploads.id = ?
-            """, (upload_id,)
-        ).fetchone()
+        row = connection.execute(DOCUMENT_SELECT + " WHERE uploads.id = ?", (upload_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="File not found.")
     return row
@@ -299,7 +311,8 @@ def process_pending_entity_resolution(upload_id: str | None = None) -> None:
         rows = connection.execute(
             """SELECT document_facts.upload_id FROM document_facts
             LEFT JOIN document_entity_links ON document_entity_links.document_id=document_facts.upload_id
-            WHERE document_facts.status='ready' AND (document_entity_links.status IS NULL OR document_entity_links.status='queued')"""
+            WHERE document_facts.status='ready' AND (document_entity_links.status IS NULL OR document_entity_links.status='queued')
+              AND NOT EXISTS (SELECT 1 FROM document_spaces WHERE document_spaces.document_id=document_facts.upload_id)"""
             + filter_sql + " ORDER BY document_facts.upload_id",
             params,
         ).fetchall()
@@ -403,18 +416,7 @@ def read_root() -> dict[str, str]:
 @app.get("/uploads")
 def list_uploads() -> list[dict[str, str | int | None]]:
     with closing(get_connection()) as connection:
-        rows = connection.execute(
-            """
-            SELECT uploads.*, extractions.status AS extraction_status, document_indexes.status AS index_status, document_facts.status AS fact_status,
-                   document_entity_links.entity_id, document_entity_links.status AS entity_status,
-                   document_entity_links.reason AS entity_reason, entities.display_name AS entity_name
-            FROM uploads JOIN extractions ON extractions.upload_id = uploads.id
-            LEFT JOIN document_indexes ON document_indexes.upload_id = uploads.id
-            LEFT JOIN document_facts ON document_facts.upload_id = uploads.id
-            LEFT JOIN document_entity_links ON document_entity_links.document_id = uploads.id
-            LEFT JOIN entities ON entities.id = document_entity_links.entity_id ORDER BY uploads.uploaded_at DESC
-            """
-        ).fetchall()
+        rows = connection.execute(DOCUMENT_SELECT + " ORDER BY uploads.uploaded_at DESC").fetchall()
     return [document_payload(row) for row in rows]
 
 
@@ -436,9 +438,15 @@ def create_entity(payload: dict[str, object]) -> dict[str, object]:
 
 
 @app.post("/uploads", status_code=201)
-def upload_file(file: UploadFile = File(...)) -> dict[str, str | int | None]:
+def upload_file(file: UploadFile = File(...), spaceId: str | None = Form(None)) -> dict[str, str | int | None]:
+    """Upload a document as customer knowledge, or file it straight into a shared space."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="A file is required.")
+    space_id = spaceId.strip() if isinstance(spaceId, str) and spaceId.strip() else None
+    if space_id is not None:
+        with closing(get_connection()) as connection:
+            if knowledge.get_space(connection, space_id) is None:
+                raise HTTPException(status_code=404, detail="Knowledge space not found.")
 
     upload_id = str(uuid.uuid4())
     original_name = Path(file.filename).name
@@ -477,14 +485,12 @@ def upload_file(file: UploadFile = File(...)) -> dict[str, str | int | None]:
             "INSERT INTO extractions (upload_id, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (upload_id, extraction_status, uploaded_at, uploaded_at),
         )
+        if space_id is not None:
+            knowledge.file_into_space(connection, upload_id, space_id)
         connection.commit()
     if extraction_status == "queued":
         enqueue_processing()
-    return {
-        "id": upload_id, "name": original_name, "type": mime_type, "sizeBytes": size_bytes,
-        "uploadedAt": uploaded_at, "url": f"/uploads/{upload_id}/file", "extractionStatus": extraction_status, "indexStatus": None, "factStatus": None,
-        "entityId": None, "entityName": None, "entityStatus": None, "entityReason": None,
-    }
+    return document_payload(get_upload(upload_id))
 
 
 @app.get("/uploads/{upload_id}/extraction")
@@ -508,6 +514,8 @@ def assign_upload_entity(upload_id: str, payload: dict[str, object]) -> dict[str
     if not isinstance(entity_id, str) or not entity_id.strip():
         raise HTTPException(status_code=400, detail="A customer ID is required.")
     upload = get_upload(upload_id)
+    if upload["space_id"] is not None:
+        raise HTTPException(status_code=409, detail=f"This document is filed as shared knowledge in {upload['space_name']}. Move it to customer knowledge before assigning a customer.")
     if upload["entity_status"] in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="Automatic customer resolution is in progress. Try again shortly.")
     with closing(get_connection()) as connection:
@@ -572,6 +580,7 @@ def delete_upload(upload_id: str) -> Response:
         rag.delete_document(connection, upload_id)
         facts.delete_document(connection, upload_id)
         entities.delete_document(connection, upload_id)
+        knowledge.delete_document(connection, upload_id)
         connection.execute("DELETE FROM extractions WHERE upload_id = ?", (upload_id,))
         connection.execute("DELETE FROM uploads WHERE id = ?", (upload_id,))
         connection.commit()
@@ -630,10 +639,31 @@ def _prepare_question(payload: dict[str, object], original_question: str | None 
             "answer": "This customer has no linked documents to answer from yet.",
             "sources": [], "mode": "entity", "debug": trace,
         }, [], trace
+    return _answer_from_scope(question, document_ids, trace)
+
+
+STRUCTURED_CAPABILITIES = {"fact_lookup", "calculations", "policy_evaluation", "customer_profile"}
+
+
+def _answer_from_scope(
+    question: str, document_ids: list[str] | None, trace: dict[str, object], capabilities: set[str] | None = None,
+) -> tuple[dict[str, object] | None, list[sqlite3.Row], dict[str, object]]:
+    """Run structured facts, then strict RAG, over an already-authorised scope.
+
+    ``capabilities`` is an agent's allowed tool set; ``None`` keeps the legacy
+    unrestricted behaviour. An empty list scope must never reach retrieval,
+    because the engines treat a missing scope as the whole library.
+    """
+    if document_ids is not None and not document_ids:
+        raise ValueError("An empty document scope cannot be searched.")
     try:
-        with closing(get_connection()) as connection:
-            structured_answer, structured_trace = facts.answer_with_trace(connection, question, document_ids)
-        trace["structuredFacts"] = structured_trace
+        structured_answer = None
+        if capabilities is None or capabilities & STRUCTURED_CAPABILITIES:
+            with closing(get_connection()) as connection:
+                structured_answer, structured_trace = facts.answer_with_trace(connection, question, document_ids, capabilities=capabilities)
+            trace["structuredFacts"] = structured_trace
+        else:
+            trace["structuredFacts"] = {"reason": "This agent has no structured-fact capabilities."}
         if structured_answer is not None:
             answer, fact_rows = structured_answer
             trace["route"] = "structured-facts"
@@ -642,6 +672,13 @@ def _prepare_question(payload: dict[str, object], original_question: str | None 
                 "answer": answer,
                 "sources": citation_sources(fact_rows, "document_id"),
                 "mode": "structured", "debug": trace,
+            }, [], trace
+        if capabilities is not None and "document_search" not in capabilities:
+            trace["route"] = "capability-not-enabled"
+            return {
+                "answer": "I could not answer this from verified facts, and this agent is not permitted to search document passages. "
+                          "An administrator can enable \"Search document passages\" in the Agent Builder.",
+                "sources": [], "mode": "agent", "debug": trace,
             }, [], trace
         with closing(get_connection()) as connection:
             chunks, rag_trace = rag.retrieve_with_trace(connection, question, document_ids)
@@ -656,6 +693,81 @@ def _prepare_question(payload: dict[str, object], original_question: str | None 
         return {"answer": "I could not find strong enough evidence in the indexed documents.", "sources": [], "mode": "rag", "debug": trace}, [], trace
     trace["claudeInputEvidenceIds"] = [row["id"] for row in chunks]
     return None, chunks, trace
+
+
+def _agent_context(connection: sqlite3.Connection, agent_id: str, entity_id: str | None) -> tuple[sqlite3.Row, dict[str, object]]:
+    agent = agents.get_agent(connection, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="This chat's agent no longer exists.")
+    try:
+        return agent, agents.resolve_knowledge(connection, agent, entity_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _knowledge_summary(context: dict[str, object]) -> dict[str, object]:
+    """What an answer was allowed to read, as shown to the user and stored with it."""
+    return {
+        "agent": context["agent"], "entity": context["entity"],
+        "sources": [
+            {"id": source["id"], "kind": source["kind"], "name": source["name"], "documentCount": source["documentCount"]}
+            for source in context["sources"]
+        ],
+        "documentCount": len(context["documentIds"]),
+    }
+
+
+def _prepare_agent_question(
+    question: str, raw_question: str, agent: sqlite3.Row, context: dict[str, object],
+) -> tuple[dict[str, object] | None, list[sqlite3.Row], dict[str, object]]:
+    """Answer within an agent's governed knowledge for one customer context.
+
+    The document scope is exactly the resolved knowledge; nothing in the
+    question can widen it. A question that names a different customer is
+    refused, rather than silently answered from this chat's customer.
+    """
+    entity = context["entity"]
+    trace: dict[str, object] = {
+        "question": raw_question,
+        "agent": {"id": agent["id"], "name": agent["name"], "capabilities": json.loads(agent["capabilities"])},
+        "knowledge": _knowledge_summary(context),
+        "documentScope": [source["name"] for source in context["sources"]],
+    }
+    if raw_question != question:
+        trace["standaloneQuestion"] = question
+    with closing(get_connection()) as connection:
+        named = entities.question_scope(connection, raw_question)
+    if named.get("mode") == "entity" and named.get("entityId") != (entity or {}).get("id"):
+        trace["route"] = "other-customer-refused"
+        current = f"{entity['name']}" if entity else "shared knowledge only (no customer)"
+        return {
+            "answer": f"This chat is scoped to {current}, so I can't use {named['entityName']}'s documents here. "
+                      f"Start a new {agent['name']} chat with {named['entityName']} selected.",
+            "sources": [], "mode": "agent", "debug": trace,
+        }, [], trace
+    document_ids = list(context["documentIds"])
+    if not document_ids:
+        trace["route"] = "no-knowledge-documents"
+        where = f"{entity['name']}'s documents or " if entity else ""
+        return {
+            "answer": f"There are no documents in {where}this agent's knowledge spaces yet, so I have nothing to answer from.",
+            "sources": [], "mode": "agent", "debug": trace,
+        }, [], trace
+    capabilities = set(json.loads(agent["capabilities"]))
+    if entity and "consistency_check" in capabilities and agents.is_consistency_question(raw_question):
+        with closing(get_connection()) as connection:
+            conflicts, compared, evidence = agents.consistency_check(connection, list(context["entityDocumentIds"]))
+        trace["route"] = "consistency-check"
+        trace["consistency"] = {
+            "comparedConceptCount": compared,
+            "conflicts": [{"concept": item["concept"], "factIds": [row["id"] for row in item["variants"]]} for item in conflicts],
+        }
+        trace["finalEvidenceIds"] = [row["id"] for row in evidence]
+        return {
+            "answer": agents.describe_conflicts(conflicts, compared, entity["name"]),
+            "sources": citation_sources(evidence, "document_id"), "mode": "consistency", "debug": trace,
+        }, [], trace
+    return _answer_from_scope(question, document_ids, trace, capabilities)
 
 
 def _finish_rag(answer: str, cited_chunk_ids: list[str], chunks: list[sqlite3.Row], trace: dict[str, object]) -> dict[str, object]:
@@ -706,6 +818,9 @@ def _turn_is_pending(connection: sqlite3.Connection, conversation_id: str, turn_
 
 @app.post("/conversations", status_code=201)
 def create_conversation(payload: dict[str, object]) -> dict[str, object]:
+    agent_id = payload.get("agentId")
+    if agent_id is not None:
+        return _create_agent_conversation(agent_id, payload)
     scope_mode = payload.get("scopeMode", "all")
     entity_id = payload.get("entityId")
     document_ids = payload.get("documentIds")
@@ -736,12 +851,44 @@ def create_conversation(payload: dict[str, object]) -> dict[str, object]:
         return chat_history.conversation_payload(_conversation(connection, conversation_id))
 
 
+def _create_agent_conversation(agent_id: object, payload: dict[str, object]) -> dict[str, object]:
+    entity_id = payload.get("entityId")
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise HTTPException(status_code=400, detail="agentId must be an agent ID.")
+    if entity_id is not None and (not isinstance(entity_id, str) or not entity_id.strip()):
+        raise HTTPException(status_code=400, detail="entityId must be a customer ID.")
+    if payload.get("documentIds") is not None or payload.get("scopeMode") not in (None, "agent"):
+        raise HTTPException(status_code=400, detail="Agent chats use the agent's knowledge access, not a manual scope.")
+    with closing(get_connection()) as connection:
+        if agents.get_agent(connection, agent_id) is None:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        _agent_context(connection, agent_id, entity_id)  # validates the customer context
+        conversation_id = chat_history.new_id()
+        timestamp = utc_now()
+        connection.execute(
+            """INSERT INTO conversations(id, title, scope_mode, entity_id, document_ids, agent_id, created_at, updated_at)
+            VALUES (?, 'New chat', 'agent', ?, '[]', ?, ?, ?)""",
+            (conversation_id, entity_id, agent_id, timestamp, timestamp),
+        )
+        connection.commit()
+        return chat_history.conversation_payload(_conversation(connection, conversation_id))
+
+
 @app.get("/conversations")
-def list_conversations(limit: int = 50, offset: int = 0) -> list[dict[str, object]]:
+def list_conversations(limit: int = 50, offset: int = 0, agentId: str | None = None) -> list[dict[str, object]]:
+    """List chats, optionally for one agent (``agentId=none`` lists pre-agent chats)."""
     if limit < 1 or limit > 100 or offset < 0:
         raise HTTPException(status_code=400, detail="Invalid conversation page.")
+    where, params = "", []
+    if agentId == "none":
+        where = " WHERE agent_id IS NULL"
+    elif agentId:
+        where, params = " WHERE agent_id=?", [agentId]
     with closing(get_connection()) as connection:
-        rows = connection.execute("SELECT * FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        rows = connection.execute(
+            "SELECT * FROM conversations" + where + " ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
         return [chat_history.conversation_payload(row) for row in rows]
 
 
@@ -757,7 +904,15 @@ def get_conversation(conversation_id: str) -> dict[str, object]:
             ORDER BY u.created_at, u.id, CASE m.role WHEN 'user' THEN 0 ELSE 1 END""",
             (conversation_id,),
         ).fetchall()
-        return {**chat_history.conversation_payload(conversation), "messages": [chat_history.message_payload(row) for row in messages]}
+        detail = {**chat_history.conversation_payload(conversation), "messages": [chat_history.message_payload(row) for row in messages]}
+        if conversation["agent_id"]:
+            try:
+                _, context = _agent_context(connection, conversation["agent_id"], conversation["entity_id"])
+                detail["knowledge"] = _knowledge_summary(context)
+            except HTTPException as error:
+                detail["knowledge"] = None
+                detail["knowledgeError"] = error.detail
+        return detail
 
 
 @app.patch("/conversations/{conversation_id}")
@@ -836,12 +991,21 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
                 if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
                     raise ChatCancelled()
             yield _sse("status", {"stage": "retrieval", "label": "Finding document evidence"})
-            ask_payload: dict[str, object] = {"question": effective_question}
-            if scope["scopeMode"] == "customer":
-                ask_payload["entityId"] = scope["entityId"]
-            elif scope["scopeMode"] == "documents":
-                ask_payload["documentIds"] = scope["documentIds"]
-            prepared, chunks, trace = _prepare_question(ask_payload, question)
+            agent_row: sqlite3.Row | None = None
+            knowledge_used: dict[str, object] | None = None
+            if scope["agentId"]:
+                with closing(get_connection()) as connection:
+                    agent_row, agent_context = _agent_context(connection, scope["agentId"], scope["entityId"])
+                knowledge_used = _knowledge_summary(agent_context)
+                yield _sse("status", {"stage": "retrieval", "label": f"Searching {', '.join(source['name'] for source in agent_context['sources'])}"})
+                prepared, chunks, trace = _prepare_agent_question(effective_question, question, agent_row, agent_context)
+            else:
+                ask_payload: dict[str, object] = {"question": effective_question}
+                if scope["scopeMode"] == "customer":
+                    ask_payload["entityId"] = scope["entityId"]
+                elif scope["scopeMode"] == "documents":
+                    ask_payload["documentIds"] = scope["documentIds"]
+                prepared, chunks, trace = _prepare_question(ask_payload, question)
             trace["conversationContext"] = context_trace
             with closing(get_connection()) as connection:
                 if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
@@ -860,7 +1024,8 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
                 answer = ""
                 citations: list[str] = []
                 delta_count = 0
-                for item in rag.answer_stream(effective_question, chunks):
+                answer_options = {"model": agent_row["model"], "instructions": agent_row["instructions"]} if agent_row is not None else {}
+                for item in rag.answer_stream(effective_question, chunks, **answer_options):
                     if item["type"] == "delta":
                         delta_count += 1
                         if delta_count % 15 == 0:
@@ -880,8 +1045,9 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
                 if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
                     raise ChatCancelled()
                 connection.execute(
-                    "INSERT OR REPLACE INTO chat_messages(id, conversation_id, turn_id, role, content, status, sources_json, mode, debug_json, created_at) VALUES (?, ?, ?, 'assistant', ?, 'completed', ?, ?, ?, ?)",
-                    (chat_history.new_id(), conversation_id, turn_id, result["answer"], json.dumps(result["sources"]), result["mode"], json.dumps(result["debug"]), timestamp),
+                    "INSERT OR REPLACE INTO chat_messages(id, conversation_id, turn_id, role, content, status, sources_json, mode, debug_json, context_json, created_at) VALUES (?, ?, ?, 'assistant', ?, 'completed', ?, ?, ?, ?, ?)",
+                    (chat_history.new_id(), conversation_id, turn_id, result["answer"], json.dumps(result["sources"]), result["mode"], json.dumps(result["debug"]),
+                     json.dumps(knowledge_used) if knowledge_used else None, timestamp),
                 )
                 connection.execute(
                     "UPDATE chat_messages SET status='completed' WHERE conversation_id=? AND turn_id=? AND role='user' AND attempt_id=?",
@@ -971,3 +1137,152 @@ def download_upload(upload_id: str) -> FileResponse:
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Stored file is missing.")
     return FileResponse(file_path, media_type=upload["mime_type"], filename=upload["original_name"])
+
+
+# --- Knowledge spaces -------------------------------------------------------
+
+def _space_text(payload: dict[str, object], key: str, minimum: int, maximum: int, label: str) -> str:
+    value = payload.get(key, "")
+    if not isinstance(value, str) or not minimum <= len(value.strip()) <= maximum:
+        raise HTTPException(status_code=400, detail=f"{label} must be between {minimum} and {maximum} characters.")
+    return value.strip()
+
+
+@app.get("/knowledge/spaces")
+def list_knowledge_spaces() -> list[dict[str, object]]:
+    with closing(get_connection()) as connection:
+        return knowledge.list_spaces(connection)
+
+
+@app.post("/knowledge/spaces", status_code=201)
+def create_knowledge_space(payload: dict[str, object]) -> dict[str, object]:
+    name = _space_text(payload, "name", 2, 80, "Space name")
+    description = _space_text(payload, "description", 0, 400, "Description")
+    kind = payload.get("kind")
+    with closing(get_connection()) as connection:
+        try:
+            space_id = knowledge.create_space(connection, str(kind), name, description)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        connection.commit()
+        return knowledge.space_payload(knowledge.get_space(connection, space_id))
+
+
+@app.patch("/knowledge/spaces/{space_id}")
+def update_knowledge_space(space_id: str, payload: dict[str, object]) -> dict[str, object]:
+    name = _space_text(payload, "name", 2, 80, "Space name")
+    description = _space_text(payload, "description", 0, 400, "Description")
+    with closing(get_connection()) as connection:
+        if knowledge.get_space(connection, space_id) is None:
+            raise HTTPException(status_code=404, detail="Knowledge space not found.")
+        connection.execute("UPDATE knowledge_spaces SET name=?, description=?, updated_at=? WHERE id=?", (name, description, utc_now(), space_id))
+        connection.commit()
+        return knowledge.space_payload(knowledge.get_space(connection, space_id))
+
+
+@app.delete("/knowledge/spaces/{space_id}", status_code=204, response_class=Response)
+def delete_knowledge_space(space_id: str) -> Response:
+    with closing(get_connection()) as connection:
+        space = knowledge.get_space(connection, space_id)
+        if space is None:
+            raise HTTPException(status_code=404, detail="Knowledge space not found.")
+        if space["document_count"]:
+            raise HTTPException(status_code=409, detail=f"Move or delete the {space['document_count']} document(s) in {space['name']} first.")
+        agents.remove_space_from_agents(connection, space_id)
+        connection.execute("DELETE FROM knowledge_spaces WHERE id=?", (space_id,))
+        connection.commit()
+    return Response(status_code=204)
+
+
+@app.put("/uploads/{upload_id}/knowledge")
+def file_upload_knowledge(upload_id: str, payload: dict[str, object]) -> dict[str, str | int | None]:
+    """File a document into a shared space, or (spaceId null) return it to customer knowledge."""
+    upload = get_upload(upload_id)
+    space_id = payload.get("spaceId")
+    if space_id is not None and (not isinstance(space_id, str) or not space_id.strip()):
+        raise HTTPException(status_code=400, detail="spaceId must be a knowledge space ID or null.")
+    if upload["entity_status"] == "processing":
+        raise HTTPException(status_code=409, detail="Customer resolution is still processing. Try again shortly.")
+    with closing(get_connection()) as connection:
+        if space_id is None:
+            if upload["space_id"] is not None:
+                knowledge.move_to_entity_knowledge(connection, upload_id)
+        else:
+            try:
+                knowledge.file_into_space(connection, upload_id, space_id)
+            except ValueError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+        connection.commit()
+    enqueue_processing()
+    return document_payload(get_upload(upload_id))
+
+
+# --- Agents -----------------------------------------------------------------
+
+@app.get("/agents/catalog")
+def agent_catalog() -> dict[str, object]:
+    return agents.catalog()
+
+
+@app.get("/agents")
+def list_agents() -> list[dict[str, object]]:
+    with closing(get_connection()) as connection:
+        return agents.list_agents(connection)
+
+
+@app.post("/agents", status_code=201)
+def create_agent(payload: dict[str, object]) -> dict[str, object]:
+    with closing(get_connection()) as connection:
+        try:
+            definition = agents.validate(connection, payload)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        agent_id = agents.create_agent(connection, definition)
+        connection.commit()
+        return agents.agent_payload(agents.get_agent(connection, agent_id))
+
+
+@app.get("/agents/{agent_id}")
+def get_agent(agent_id: str) -> dict[str, object]:
+    with closing(get_connection()) as connection:
+        agent = agents.get_agent(connection, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        return agents.agent_payload(agent)
+
+
+@app.put("/agents/{agent_id}")
+def update_agent(agent_id: str, payload: dict[str, object]) -> dict[str, object]:
+    with closing(get_connection()) as connection:
+        if agents.get_agent(connection, agent_id) is None:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        try:
+            definition = agents.validate(connection, payload, agent_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        agents.update_agent(connection, agent_id, definition)
+        connection.commit()
+        return agents.agent_payload(agents.get_agent(connection, agent_id))
+
+
+@app.delete("/agents/{agent_id}", status_code=204, response_class=Response)
+def delete_agent(agent_id: str) -> Response:
+    with closing(get_connection()) as connection:
+        agent = agents.get_agent(connection, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        if agent["is_builtin"]:
+            raise HTTPException(status_code=409, detail="Built-in agents can be edited but not deleted.")
+        # The agent's chats cannot be answered without it; remove them with it.
+        connection.execute("DELETE FROM conversations WHERE agent_id=?", (agent_id,))
+        connection.execute("DELETE FROM agents WHERE id=?", (agent_id,))
+        connection.commit()
+    return Response(status_code=204)
+
+
+@app.get("/agents/{agent_id}/knowledge")
+def preview_agent_knowledge(agent_id: str, entityId: str | None = None) -> dict[str, object]:
+    """Show exactly which knowledge an agent would use for a customer, before chatting."""
+    with closing(get_connection()) as connection:
+        _, context = _agent_context(connection, agent_id, entityId or None)
+        return _knowledge_summary(context)

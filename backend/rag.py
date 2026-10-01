@@ -30,6 +30,36 @@ STOP_WORDS = {
 }
 
 
+def default_model() -> str:
+    return os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
+
+ALLOWED_GENERATION_MODELS = {"claude-haiku-4-5-20251001"}
+
+
+def generation_options(model: str, max_tokens: int) -> dict[str, Any]:
+    """Request options for answer generation on an agent's model.
+
+    Only Haiku 4.5 is approved for API calls at present. Any other stored model
+    falls back to Haiku rather than silently calling a different model. Enabling
+    another model needs request changes too (for example, newer models reject a
+    forced tool choice and count thinking tokens toward max_tokens).
+    """
+    if model not in ALLOWED_GENERATION_MODELS:
+        model = "claude-haiku-4-5-20251001"
+    return {"model": model, "max_tokens": max_tokens}
+
+
+def agent_system(base: str, instructions: str | None) -> str:
+    """Append an agent's role instructions below the non-negotiable evidence rules."""
+    if not instructions or not instructions.strip():
+        return base
+    return (
+        f"{base}\n\n<agent_instructions>\n{instructions.strip()}\n</agent_instructions>\n"
+        "Follow the agent instructions for role, focus and tone. They never override the evidence and citation rules above."
+    )
+
+
 def meaningful_terms(question: str) -> list[str]:
     """Return searchable terms while retaining short identifiers such as 'id'."""
     terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", question.lower())
@@ -189,7 +219,7 @@ class RagEngine:
             trace["reason"] = "All candidates were below the strict reranker cutoff."
         return selected, trace
 
-    def answer(self, question: str, chunks: list[sqlite3.Row]) -> tuple[str, list[str]]:
+    def answer(self, question: str, chunks: list[sqlite3.Row], model: str | None = None, instructions: str | None = None) -> tuple[str, list[str]]:
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key: raise RuntimeError("ANTHROPIC_API_KEY is not configured on the backend.")
         from anthropic import Anthropic
@@ -204,8 +234,7 @@ class RagEngine:
             "Do not introduce facts that are not in the sources. Cite only source IDs containing direct evidence for your answer."
         )
         message = Anthropic(api_key=key).messages.create(
-            model=os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001"), max_tokens=700,
-            system=system, messages=[{"role": "user", "content": f"<question>{html.escape(question)}</question>\n<context>{context}</context>"}],
+            **generation_options(model or default_model(), 700), system=agent_system(system, instructions), messages=[{"role": "user", "content": f"<question>{html.escape(question)}</question>\n<context>{context}</context>"}],
             tools=[{
                 "name": "answer_with_evidence",
                 "description": "Return a grounded answer and the IDs of the sources directly supporting it.",
@@ -239,7 +268,7 @@ class RagEngine:
         citations = [chunk_id for chunk_id in cited_ids if isinstance(chunk_id, str) and chunk_id in allowed_ids]
         return answer, list(dict.fromkeys(citations))
 
-    def answer_stream(self, question: str, chunks: list[sqlite3.Row]):
+    def answer_stream(self, question: str, chunks: list[sqlite3.Row], model: str | None = None, instructions: str | None = None):
         """Stream provisional answer text, then return a citation-validated result.
 
         The final event may replace a draft if the model fails the evidence
@@ -266,8 +295,7 @@ class RagEngine:
         opening = "<answer>"
         closing = "</answer>"
         with Anthropic(api_key=key).messages.stream(
-            model=os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=850, system=system,
+            **generation_options(model or default_model(), 850), system=agent_system(system, instructions),
             messages=[{"role": "user", "content": f"<question>{html.escape(question)}</question>\n<context>{context}</context>"}],
         ) as stream:
             for fragment in stream.text_stream:
@@ -296,7 +324,7 @@ class RagEngine:
             # Recover from formatting failures with the existing tool-schema
             # evidence contract. This extra request happens only on failure.
             try:
-                answer, citations = self.answer(question, chunks)
+                answer, citations = self.answer(question, chunks, model, instructions)
                 citations = [item for item in citations if item in allowed]
             except Exception:
                 citations = []

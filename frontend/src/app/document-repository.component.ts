@@ -1,6 +1,8 @@
+import { IconComponent } from './icon.component';
 import { CommonModule } from '@angular/common';
-import { Component, Input, OnDestroy, OnInit } from '@angular/core';
+import { Component, EventEmitter, Input, OnDestroy, OnInit, Output } from '@angular/core';
 import { HttpClient, HttpClientModule } from '@angular/common/http';
+import { KIND_LABELS, KnowledgeKind, KnowledgeSpace } from './models';
 
 type ExtractionStatus = 'queued' | 'processing' | 'completed' | 'failed' | 'unsupported';
 type EntityStatus = 'queued' | 'processing' | 'linked' | 'needs_review' | 'failed';
@@ -19,6 +21,9 @@ interface UploadedDocument {
   entityName?: string | null;
   entityStatus?: EntityStatus | null;
   entityReason?: string | null;
+  knowledgeKind: KnowledgeKind;
+  spaceId?: string | null;
+  spaceName?: string | null;
 }
 
 interface Customer {
@@ -55,47 +60,59 @@ interface DocumentFacts {
 @Component({
   selector: 'app-document-repository',
   standalone: true,
-  imports: [CommonModule, HttpClientModule],
+  imports: [IconComponent, CommonModule, HttpClientModule],
   template: `
       <section class="workspace repository-workspace">
         <div class="workspace-toolbar">
           <div><h1>Document Repository</h1><span class="document-count">{{ documents.length }} total</span></div>
-          <label class="upload-button" for="file-input">Upload files</label>
+          <label class="upload-button" for="file-input"><app-icon name="upload"></app-icon>Upload files</label>
           <input id="file-input" type="file" multiple accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt" (change)="selectFiles($event)">
         </div>
 
         <div class="upload-bar" [class.dragging]="isDragging" (dragover)="onDragOver($event)" (dragleave)="isDragging = false" (drop)="onDrop($event)">
-          <span class="upload-symbol">+</span>
+          <span class="upload-symbol"><app-icon name="upload"></app-icon></span>
           <span class="upload-name">{{ uploadSelectionLabel() }}</span>
+          <label class="upload-destination">File into
+            <select aria-label="Knowledge destination" [value]="uploadSpaceId" (change)="uploadSpaceId = $any($event.target).value" [disabled]="isUploading">
+              <option value="">Customer knowledge (detect customer)</option>
+              <option *ngFor="let space of spaces" [value]="space.id">{{ space.name }} ({{ kindLabels[space.kind] }})</option>
+            </select>
+          </label>
           <span *ngIf="selectedFiles.length" class="upload-size">{{ formatBytes(selectedFilesSize()) }}</span>
           <button *ngIf="selectedFiles.length" type="button" class="submit-upload" [disabled]="isUploading" (click)="upload()">{{ isUploading ? 'Uploading ' + uploadProgress + ' of ' + selectedFiles.length : 'Upload ' + selectedFiles.length + (selectedFiles.length === 1 ? ' file' : ' files') }}</button>
         </div>
         <p *ngIf="error" class="error-banner">{{ error }}</p>
 
         <section class="document-table">
-          <div class="table-heading"><span>Name</span><span>Type</span><span>Customer</span><span>Status</span><span>Uploaded</span><span></span></div>
+          <div class="table-heading"><span>Name</span><span>Type</span><span>Knowledge context</span><span>Status</span><span>Uploaded</span><span></span></div>
           <div *ngIf="isLoading" class="empty-table">Loading documents...</div>
           <div *ngIf="!isLoading && documents.length === 0" class="empty-table">No documents uploaded.</div>
           <button class="document-row" type="button" *ngFor="let document of documents" (click)="openDetails(document)">
-            <span class="name-cell"><span class="file-icon" [class.image]="document.type.startsWith('image/')">{{ iconFor(document.type) }}</span><span class="document-name">{{ document.name }}<small>{{ formatBytes(document.sizeBytes) }}</small></span></span>
+            <span class="name-cell"><span class="file-icon" [class.image]="document.type.startsWith('image/')"><app-icon [name]="document.type.startsWith('image/') ? 'image' : 'file'"></app-icon></span><span class="document-name">{{ document.name }}<small>{{ formatBytes(document.sizeBytes) }}</small></span></span>
             <span class="document-type">{{ fileType(document.type) }}</span>
-            <span class="document-owner" [class.review]="document.entityStatus === 'needs_review' || document.entityStatus === 'failed'">{{ entityLabel(document) }}</span>
+            <span class="document-owner" [class.review]="document.knowledgeKind === 'entity' && (document.entityStatus === 'needs_review' || document.entityStatus === 'failed')"><span [class]="'kind-dot kind-' + document.knowledgeKind" [title]="kindLabels[document.knowledgeKind]"></span>{{ knowledgeLabel(document) }}</span>
             <span class="status-badge" [class]="'status-' + document.extractionStatus">{{ statusLabel(document.extractionStatus) }}</span>
             <span class="document-date">{{ document.uploadedAt | date:'mediumDate' }}</span>
-            <span class="row-arrow">&rarr;</span>
+            <span class="row-arrow"><app-icon name="arrow"></app-icon></span>
           </button>
         </section>
       </section>
 
     <div *ngIf="activeDocument" class="detail-backdrop" (click)="closeDetails()">
       <aside class="detail-panel" (click)="$event.stopPropagation()">
-        <div class="detail-topline"><span>Document details</span><button class="close-button" type="button" aria-label="Close" (click)="closeDetails()">&times;</button></div>
+        <div class="detail-topline"><span>Document details</span><button class="close-button" type="button" aria-label="Close" (click)="closeDetails()"><app-icon name="close"></app-icon></button></div>
         <h2>{{ activeDocument.name }}</h2>
         <div class="metadata"><span>{{ fileType(activeDocument.type) }}</span><span>{{ formatBytes(activeDocument.sizeBytes) }}</span><span>{{ activeDocument.uploadedAt | date:'mediumDate' }}</span></div>
-        <section class="ownership-state" [class.review]="activeDocument.entityStatus === 'needs_review' || activeDocument.entityStatus === 'failed'">
+        <section class="knowledge-state" [class]="'knowledge-state kind-' + activeDocument.knowledgeKind">
+          <span>Knowledge context</span><strong>{{ kindLabels[activeDocument.knowledgeKind] }}{{ activeDocument.spaceName ? ' · ' + activeDocument.spaceName : '' }}</strong>
+          <small>{{ activeDocument.knowledgeKind === 'entity' ? 'Customer-specific. Only used in chats about the customer who owns it.' : 'Shared. Used by every agent granted this space, for any customer.' }}</small>
+          <div class="ownership-controls"><select aria-label="Move to knowledge space" [value]="moveSpaceId" (change)="moveSpaceId = $any($event.target).value" [disabled]="isMoving"><option value="">Customer knowledge</option><option *ngFor="let space of spaces" [value]="space.id">{{ space.name }} ({{ kindLabels[space.kind] }})</option></select><button type="button" (click)="moveKnowledge()" [disabled]="isMoving || moveSpaceId === (activeDocument.spaceId || '')">Move</button></div>
+          <small *ngIf="knowledgeError" class="ownership-error">{{ knowledgeError }}</small>
+        </section>
+        <section *ngIf="activeDocument.knowledgeKind === 'entity'" class="ownership-state" [class.review]="activeDocument.entityStatus === 'needs_review' || activeDocument.entityStatus === 'failed'">
           <span>Customer ownership</span><strong>{{ entityLabel(activeDocument) }}</strong><small *ngIf="activeDocument.entityReason">{{ activeDocument.entityReason }}</small>
         </section>
-        <div *ngIf="activeDocument.entityStatus !== 'queued' && activeDocument.entityStatus !== 'processing'" class="ownership-editor">
+        <div *ngIf="activeDocument.knowledgeKind === 'entity' && activeDocument.entityStatus !== 'queued' && activeDocument.entityStatus !== 'processing'" class="ownership-editor">
           <label for="assign-customer">Assign to customer</label>
           <input class="ownership-search" aria-label="Find existing customer" placeholder="Find existing customer" [value]="assignmentCustomerFilter" (input)="assignmentCustomerFilter = $any($event.target).value" [disabled]="isAssigning">
           <div class="ownership-controls"><select id="assign-customer" [value]="assignmentEntityId" (change)="assignmentEntityId = $any($event.target).value" [disabled]="isAssigning"><option value="">Choose existing customer</option><option *ngFor="let customer of filteredCustomers(assignmentCustomerFilter, assignmentEntityId)" [value]="customer.id">{{ customer.name }} ({{ customer.documentCount }})</option></select><button type="button" (click)="assignCustomer()" [disabled]="isAssigning || !assignmentEntityId || assignmentEntityId === activeDocument.entityId">Assign</button></div>
@@ -133,6 +150,13 @@ interface DocumentFacts {
 })
 export class DocumentRepositoryComponent implements OnInit, OnDestroy {
   @Input() previewDocumentId: string | null = null;
+  @Output() knowledgeChanged = new EventEmitter<void>();
+  readonly kindLabels = KIND_LABELS;
+  spaces: KnowledgeSpace[] = [];
+  uploadSpaceId = '';
+  moveSpaceId = '';
+  isMoving = false;
+  knowledgeError = '';
   private readonly apiUrl = 'http://localhost:8000';
   private pollingTimer: ReturnType<typeof setTimeout> | null = null;
   private listRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -158,7 +182,32 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
 
   constructor(private readonly http: HttpClient) {}
 
-  ngOnInit(): void { this.loadDocuments(); }
+  ngOnInit(): void { this.loadDocuments(); this.loadSpaces(); }
+  private loadSpaces(): void { this.http.get<KnowledgeSpace[]>(`${this.apiUrl}/knowledge/spaces`).subscribe({ next: spaces => this.spaces = spaces }); }
+  knowledgeLabel(document: UploadedDocument): string {
+    return document.knowledgeKind === 'entity' ? this.entityLabel(document) : `${document.knowledgeKind === 'reference' ? 'Reference' : 'Operational'} · ${document.spaceName}`;
+  }
+  moveKnowledge(): void {
+    if (!this.activeDocument || this.isMoving) return;
+    const document = this.activeDocument;
+    const target = this.spaces.find(space => space.id === this.moveSpaceId);
+    const message = target
+      ? `File "${document.name}" into ${target.name}? It becomes shared knowledge${document.entityName ? ` and is removed from ${document.entityName}'s documents` : ''}.`
+      : `Move "${document.name}" back to customer knowledge? Its customer will be detected again.`;
+    if (!window.confirm(message)) return;
+    this.isMoving = true;
+    this.knowledgeError = '';
+    this.http.put<UploadedDocument>(`${this.apiUrl}/uploads/${document.id}/knowledge`, { spaceId: this.moveSpaceId || null }).subscribe({
+      next: (updated) => {
+        this.isMoving = false;
+        if (this.activeDocument?.id === updated.id) this.activeDocument = updated;
+        this.documents = this.documents.map((item) => item.id === updated.id ? updated : item);
+        this.loadCustomers(); this.loadSpaces(); this.knowledgeChanged.emit();
+        if (updated.entityStatus === 'queued') this.loadDocuments(true);
+      },
+      error: (response) => { this.isMoving = false; this.knowledgeError = response.error?.detail || 'Could not move the document.'; }
+    });
+  }
   ngOnDestroy(): void { this.clearPolling(); if (this.listRefreshTimer) clearTimeout(this.listRefreshTimer); }
 
   loadDocuments(silent = false): void {
@@ -176,7 +225,7 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
         if (documents.some((document) => document.extractionStatus === 'queued' || document.extractionStatus === 'processing' ||
             document.indexStatus === 'queued' || document.indexStatus === 'indexing' || document.factStatus === 'queued' ||
             document.factStatus === 'processing' || document.entityStatus === 'queued' || document.entityStatus === 'processing' ||
-            (document.factStatus === 'ready' && !document.entityStatus))) {
+            (document.factStatus === 'ready' && document.knowledgeKind === 'entity' && !document.entityStatus))) {
           this.listRefreshTimer = setTimeout(() => this.loadDocuments(true), 5000);
         }
       },
@@ -215,6 +264,7 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
       this.isUploading = false;
       this.uploadProgress = 0;
       this.selectedFiles = [];
+      if (this.uploadSpaceId) this.knowledgeChanged.emit();
       if (failures.length) this.error = `Some files could not be uploaded: ${failures.join('; ')}`;
       this.loadDocuments();
       return;
@@ -222,6 +272,7 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
     this.uploadProgress = index + 1;
     const formData = new FormData();
     formData.append('file', files[index]);
+    if (this.uploadSpaceId) formData.append('spaceId', this.uploadSpaceId);
     this.http.post<UploadedDocument>(`${this.apiUrl}/uploads`, formData).subscribe({
       next: (document) => { this.documents = [document, ...this.documents]; this.uploadNext(files, index + 1, failures); },
       error: (response) => {
@@ -237,6 +288,8 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
     this.extraction = null;
     this.documentFacts = null;
     this.assignmentEntityId = document.entityId || '';
+    this.moveSpaceId = document.spaceId || '';
+    this.knowledgeError = '';
     this.assignmentCustomerFilter = '';
     this.newCustomerName = '';
     this.ownershipError = '';
@@ -363,7 +416,7 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
         if (this.activeDocument?.id !== documentId) return;
         this.documentFacts = facts;
         if (facts.status === 'queued' || facts.status === 'processing') this.pollingTimer = setTimeout(() => this.loadFacts(documentId), 2500);
-        if (facts.status === 'ready' && (this.activeDocument?.entityStatus === 'queued' || this.activeDocument?.entityStatus === 'processing' || !this.activeDocument?.entityStatus)) this.pollingTimer = setTimeout(() => this.loadExtraction(), 1500);
+        if (facts.status === 'ready' && this.activeDocument?.knowledgeKind === 'entity' && (this.activeDocument?.entityStatus === 'queued' || this.activeDocument?.entityStatus === 'processing' || !this.activeDocument?.entityStatus)) this.pollingTimer = setTimeout(() => this.loadExtraction(), 1500);
       }
     });
   }

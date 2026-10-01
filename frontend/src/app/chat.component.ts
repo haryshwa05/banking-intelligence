@@ -1,8 +1,10 @@
+import { IconComponent } from './icon.component';
 import { CommonModule } from '@angular/common';
 import { HttpClient, HttpClientModule } from '@angular/common/http';
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, OnInit, Output, SimpleChanges } from '@angular/core';
+import { API_URL, Agent, AgentCatalog, KnowledgeInUse, KnowledgeSpace } from './models';
 
-export type ScopeMode = 'all' | 'customer' | 'documents';
+export type ScopeMode = 'all' | 'customer' | 'documents' | 'agent';
 
 export interface Conversation {
   id: string;
@@ -10,6 +12,7 @@ export interface Conversation {
   scopeMode: ScopeMode;
   entityId: string | null;
   documentIds: string[];
+  agentId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -30,10 +33,11 @@ interface Message {
   sources: Source[];
   mode: string | null;
   debug: Record<string, unknown> | null;
+  context?: KnowledgeInUse | null;
   createdAt: string;
 }
 
-interface ConversationDetail extends Conversation { messages: Message[]; }
+interface ConversationDetail extends Conversation { messages: Message[]; knowledge?: KnowledgeInUse | null; knowledgeError?: string; }
 interface Customer { id: string; name: string; documentCount: number; }
 interface ScopeDocument {
   id: string; name: string; entityName?: string | null;
@@ -43,18 +47,55 @@ interface ScopeDocument {
 @Component({
   selector: 'app-chat',
   standalone: true,
-  imports: [CommonModule, HttpClientModule],
+  imports: [IconComponent, CommonModule, HttpClientModule],
   template: `
     <section class="chat-page">
-      <header class="chat-header">
+      <header *ngIf="!agent" class="chat-header">
         <div><h1>{{ displayTitle || conversation?.title || 'New chat' }}</h1><span>{{ conversation ? scopeLabel(conversation) : 'Choose a scope, then ask your documents' }}</span></div>
         <span class="chat-header-label">Document Intelligence</span>
       </header>
 
+      <ng-container *ngIf="agent">
+        <header class="chat-header agent-header">
+          <div class="agent-header-main"><span class="agent-avatar"><app-icon name="agent"></app-icon></span><div><h1>{{ agent.name }}</h1><span>{{ conversation ? (displayTitle || conversation.title) : 'New chat' }} · {{ agent.purpose }}</span></div></div>
+        </header>
+        <section class="context-bar" aria-label="Chat context">
+          <div class="context-item">
+            <small>Customer</small>
+            <ng-container *ngIf="conversation"><strong>{{ conversationCustomerName() }}</strong><em>Fixed for this chat</em></ng-container>
+            <ng-container *ngIf="!conversation && agent.customerAccess !== 'none'">
+              <select aria-label="Select customer" [value]="selectedEntityId" (change)="selectCustomer($any($event.target).value)">
+                <option value="">{{ agent.customerAccess === 'required' ? 'Choose customer…' : 'No customer (shared knowledge only)' }}</option>
+                <option *ngFor="let customer of customers" [value]="customer.id">{{ customer.name }} ({{ customer.documentCount }} docs)</option>
+              </select>
+              <em>{{ agent.customerAccess === 'required' ? 'Required · locked once the chat starts' : 'Optional · locked once the chat starts' }}</em>
+            </ng-container>
+            <ng-container *ngIf="!conversation && agent.customerAccess === 'none'"><strong>Not used</strong><em>This agent uses shared knowledge only</em></ng-container>
+          </div>
+          <div class="context-item grow">
+            <small>Knowledge in use</small>
+            <div class="knowledge-chips">
+              <span *ngFor="let source of knowledgeSources()" [class]="'knowledge-chip kind-' + source.kind" [title]="kindLabel(source.kind)">{{ source.name }} · {{ source.documentCount }} doc{{ source.documentCount === 1 ? '' : 's' }}</span>
+              <span *ngIf="agent.customerAccess === 'required' && !conversation && !selectedEntityId" class="knowledge-chip kind-entity pending">Customer documents · choose a customer</span>
+              <span *ngIf="!knowledgeSources().length && !(agent.customerAccess === 'required' && !selectedEntityId)" class="knowledge-empty">No knowledge available</span>
+            </div>
+            <em *ngIf="knowledgeError" class="context-error">{{ knowledgeError }}</em>
+          </div>
+          <details class="context-item capabilities">
+            <summary><small>Capabilities</small><strong>{{ agent.capabilities.length }} enabled</strong></summary>
+            <ul><li *ngFor="let id of agent.capabilities" [title]="capabilityDescription(id)">{{ capabilityLabel(id) }}</li></ul>
+          </details>
+        </section>
+      </ng-container>
+
       <div class="chat-scroll" #chatScroll>
         <div class="chat-thread">
           <div *ngIf="isLoading" class="chat-empty">Loading conversation...</div>
-          <div *ngIf="!isLoading && !messages.length" class="chat-empty">Ask a question to start a chat.</div>
+          <div *ngIf="!isLoading && !messages.length && !agent" class="chat-empty">Ask a question to start a chat.</div>
+          <div *ngIf="!isLoading && !messages.length && agent" class="chat-empty agent-intro">
+            <div><span class="agent-avatar large"><app-icon name="agent"></app-icon></span><h2>{{ agent.name }}</h2><p>{{ agent.description || agent.purpose }}</p>
+              <p class="agent-intro-note">Answers use only the knowledge shown above, with page citations. Other customers' documents are never searched.</p></div>
+          </div>
           <ng-container *ngFor="let message of messages">
             <div *ngIf="message.role === 'user'" class="chat-message user-message">
               <div class="message-body"><p>{{ message.content }}</p><button *ngIf="message.status === 'failed' || message.status === 'interrupted'" type="button" class="retry-turn" (click)="retry(message)" [disabled]="isStreaming">{{ message.status === 'interrupted' ? 'Interrupted · Retry' : 'Failed · Retry' }}</button></div>
@@ -63,6 +104,7 @@ interface ScopeDocument {
               <div class="message-body">
                 <small *ngIf="message.status === 'streaming'" class="draft-label">Draft · validating sources</small><p class="assistant-copy" [class.provisional]="message.status === 'streaming'">{{ message.content }}<span *ngIf="message.status === 'streaming'" class="stream-cursor"></span></p>
                 <div *ngIf="message.sources.length" class="chat-sources"><button type="button" *ngFor="let source of message.sources" [disabled]="documentsLoaded && !hasDocument(source.documentId)" (click)="sourceOpened.emit(source.documentId)">{{ source.filename }} · p. {{ source.pageNumber }}<span *ngIf="documentsLoaded && !hasDocument(source.documentId)"> · deleted</span></button></div>
+                <small *ngIf="message.context" class="answer-context">Knowledge used: {{ contextLabel(message.context) }}</small>
                 <div *ngIf="message.debug" class="chat-trace"><button type="button" (click)="expandedTraceId = expandedTraceId === message.id ? null : message.id">{{ expandedTraceId === message.id ? 'Hide' : 'Show' }} developer trace</button><span>{{ message.mode }} route</span></div>
                 <section *ngIf="message.debug && expandedTraceId === message.id" class="developer-trace" aria-label="Developer trace"><div class="trace-header"><strong>Developer trace</strong><small>Local retrieval and final evidence path</small></div><div class="trace-overview"><div><small>Route</small><strong>{{ traceValue(message, 'route') }}</strong></div><div><small>Scope</small><strong>{{ traceValue(message, 'documentScope') }}</strong></div><div><small>Final evidence</small><strong>{{ traceValue(message, 'finalEvidenceIds') || traceValue(message, 'claudeValidatedCitationIds') || 'None' }}</strong></div></div><details open><summary>Structured facts</summary><pre>{{ traceValue(message, 'structuredFacts') | json }}</pre></details><details><summary>RAG retrieval</summary><pre>{{ traceValue(message, 'rag') | json }}</pre></details><details><summary>Complete trace</summary><pre>{{ message.debug | json }}</pre></details><p>Contains excerpts and financial data. Use only in a trusted environment.</p></section>
               </div>
@@ -74,18 +116,18 @@ interface ScopeDocument {
       </div>
 
       <div class="chat-composer-wrap">
-        <div *ngIf="!conversation && scopeMode !== 'all'" class="chat-scope-setup">
+        <div *ngIf="!agent && !conversation && scopeMode !== 'all'" class="chat-scope-setup">
           <ng-container *ngIf="scopeMode === 'customer'"><input aria-label="Find customer" placeholder="Find customer" [value]="customerFilter" (input)="customerFilter = $any($event.target).value"><select aria-label="Select customer" [value]="selectedEntityId" (change)="selectedEntityId = $any($event.target).value"><option value="">Choose customer</option><option *ngFor="let customer of filteredCustomers()" [value]="customer.id">{{ customer.name }} ({{ customer.documentCount }})</option></select></ng-container>
           <div *ngIf="scopeMode === 'documents'" class="chat-document-picker"><div><input aria-label="Find documents" placeholder="Find documents" [value]="documentFilter" (input)="documentFilter = $any($event.target).value"><span>{{ selectedDocumentIds.length }} selected</span></div><div class="chat-document-options"><label *ngFor="let document of filteredDocuments()"><input type="checkbox" [checked]="selectedDocumentIds.includes(document.id)" [disabled]="!canUseDocument(document)" (change)="toggleDocument(document.id, $any($event.target).checked)"><span>{{ document.name }}<small>{{ canUseDocument(document) ? (document.entityName || 'Unassigned') : 'Processing' }}</small></span></label></div></div>
         </div>
         <div class="chat-composer">
           <button class="composer-add" type="button" aria-label="Open Document Repository to add files" title="Open Document Repository" (click)="repositoryOpened.emit()"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 4v16M4 12h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
-          <textarea aria-label="Message your documents" rows="1" placeholder="Ask your documents" [value]="draft" (input)="onDraftInput($event)" (keydown)="onComposerKeydown($event)" [disabled]="isStreaming || isCreating"></textarea>
-          <select *ngIf="!conversation" class="composer-scope" aria-label="Evidence scope" [value]="scopeMode" (change)="scopeMode = $any($event.target).value"><option value="all">Automatic</option><option value="customer">Customer</option><option value="documents">Documents</option></select>
-          <span *ngIf="conversation" class="composer-scope-fixed" [title]="scopeLabel(conversation)">{{ compactScopeLabel(conversation) }}</span>
+          <textarea aria-label="Message" rows="1" [placeholder]="composerPlaceholder()" [value]="draft" (input)="onDraftInput($event)" (keydown)="onComposerKeydown($event)" [disabled]="isStreaming || isCreating"></textarea>
+          <select *ngIf="!agent && !conversation" class="composer-scope" aria-label="Evidence scope" [value]="scopeMode" (change)="scopeMode = $any($event.target).value"><option value="all">Automatic</option><option value="customer">Customer</option><option value="documents">Documents</option></select>
+          <span *ngIf="!agent && conversation" class="composer-scope-fixed" [title]="scopeLabel(conversation)">{{ compactScopeLabel(conversation) }}</span>
           <button class="composer-send" type="button" [attr.aria-label]="isStreaming ? 'Stop answer' : 'Send message'" [title]="isStreaming ? 'Stop' : 'Send'" [disabled]="!canSend() && !isStreaming" (click)="isStreaming ? stop() : send()"><svg *ngIf="!isStreaming" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 19V5m0 0-5 5m5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg *ngIf="isStreaming" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/></svg></button>
         </div>
-        <small class="composer-hint">Answers are grounded in retrieved document evidence. Enter to send · Shift+Enter for a new line.</small>
+        <small class="composer-hint">{{ agent && agent.customerAccess === 'required' && !conversation && !selectedEntityId ? 'Choose a customer above to start.' : 'Answers are grounded in retrieved document evidence. Enter to send · Shift+Enter for a new line.' }}</small>
       </div>
     </section>
   `
@@ -93,11 +135,14 @@ interface ScopeDocument {
 export class ChatComponent implements OnInit, OnChanges, OnDestroy {
   @Input() conversationId: string | null = null;
   @Input() displayTitle: string | null = null;
+  @Input() agent: Agent | null = null;
+  @Input() initialEntityId: string | null = null;
+  @Input() spaces: KnowledgeSpace[] = [];
   @Output() conversationChanged = new EventEmitter<Conversation>();
   @Output() sourceOpened = new EventEmitter<string>();
   @Output() repositoryOpened = new EventEmitter<void>();
 
-  private readonly apiUrl = 'http://localhost:8000';
+  private readonly apiUrl = API_URL;
   private abortController: AbortController | null = null;
   private activeTurnId: string | null = null;
   private activeAttemptId: string | null = null;
@@ -107,6 +152,9 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
   customers: Customer[] = [];
   documents: ScopeDocument[] = [];
   documentsLoaded = false;
+  catalog: AgentCatalog | null = null;
+  knowledge: KnowledgeInUse | null = null;
+  knowledgeError = '';
   scopeMode: ScopeMode = 'all';
   selectedEntityId = '';
   selectedDocumentIds: string[] = [];
@@ -122,24 +170,36 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
 
   constructor(private readonly http: HttpClient) {}
 
-  ngOnInit(): void { this.loadScopeOptions(); if (this.conversationId) this.loadConversation(this.conversationId); }
+  ngOnInit(): void {
+    this.loadScopeOptions();
+    this.selectedEntityId = this.initialEntityId || '';
+    if (this.conversationId) this.loadConversation(this.conversationId); else this.loadKnowledgePreview();
+  }
   ngOnChanges(changes: SimpleChanges): void {
-    if (!changes['conversationId'] || changes['conversationId'].firstChange) return;
-    if (this.conversation?.id === this.conversationId) return;
+    const conversationChanged = !!changes['conversationId'] && !changes['conversationId'].firstChange;
+    const agentChanged = !!changes['agent'] && !changes['agent'].firstChange && changes['agent'].previousValue?.id !== changes['agent'].currentValue?.id;
+    const entityChanged = !!changes['initialEntityId'] && !changes['initialEntityId'].firstChange;
+    if (!conversationChanged && !agentChanged && !entityChanged) return;
+    // A chat this component just created is already loaded.
+    if (conversationChanged && !agentChanged && this.conversationId && this.conversation?.id === this.conversationId) return;
     this.stop();
     this.error = '';
     this.expandedTraceId = null;
     this.conversation = null;
     this.messages = [];
     this.draft = '';
+    this.knowledge = null;
+    this.knowledgeError = '';
+    this.selectedEntityId = this.initialEntityId || '';
     if (this.conversationId) this.loadConversation(this.conversationId);
-    else { this.scopeMode = 'all'; this.selectedEntityId = ''; this.selectedDocumentIds = []; }
+    else { this.scopeMode = 'all'; this.selectedDocumentIds = []; this.loadKnowledgePreview(); }
   }
   ngOnDestroy(): void { this.stop(); }
 
   private loadScopeOptions(): void {
     this.http.get<Customer[]>(`${this.apiUrl}/entities`).subscribe({ next: rows => this.customers = rows });
     this.http.get<ScopeDocument[]>(`${this.apiUrl}/uploads`).subscribe({ next: rows => { this.documents = rows; this.documentsLoaded = true; } });
+    this.http.get<AgentCatalog>(`${this.apiUrl}/agents/catalog`).subscribe({ next: catalog => this.catalog = catalog });
   }
   private loadConversation(id: string): void {
     this.isLoading = true;
@@ -148,11 +208,45 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
         if (this.conversationId !== id) return;
         this.conversation = detail;
         this.messages = detail.messages;
+        this.knowledge = detail.knowledge || null;
+        this.knowledgeError = detail.knowledgeError || '';
         this.isLoading = false;
         this.scrollToBottom();
       },
       error: () => { this.isLoading = false; this.error = 'Could not load this conversation.'; }
     });
+  }
+  /** Show the exact knowledge this agent would use before the chat starts. */
+  private loadKnowledgePreview(): void {
+    const agent = this.agent;
+    this.knowledgeError = '';
+    if (!agent || this.conversation) return;
+    if (agent.customerAccess === 'required' && !this.selectedEntityId) {
+      this.knowledge = { agent: { id: agent.id, name: agent.name }, entity: null, documentCount: 0,
+        sources: this.spaces.filter(space => agent.spaceIds.includes(space.id)).map(space => ({ id: space.id, kind: space.kind, name: space.name, documentCount: space.documentCount })) };
+      return;
+    }
+    const query = this.selectedEntityId ? `?entityId=${encodeURIComponent(this.selectedEntityId)}` : '';
+    this.http.get<KnowledgeInUse>(`${this.apiUrl}/agents/${encodeURIComponent(agent.id)}/knowledge${query}`).subscribe({
+      next: knowledge => { if (this.agent?.id === agent.id && !this.conversation) this.knowledge = knowledge; },
+      error: response => { this.knowledge = null; this.knowledgeError = response.error?.detail || 'Could not load this agent\'s knowledge.'; }
+    });
+  }
+  selectCustomer(id: string): void { this.selectedEntityId = id; this.loadKnowledgePreview(); }
+  knowledgeSources() { return this.knowledge?.sources || []; }
+  conversationCustomerName(): string {
+    if (!this.conversation?.entityId) return 'None (shared knowledge only)';
+    return this.knowledge?.entity?.name || this.customers.find(item => item.id === this.conversation?.entityId)?.name || 'Customer';
+  }
+  contextLabel(context: KnowledgeInUse): string { return context.sources.map(source => source.name).join(' · ') || 'none'; }
+  kindLabel(kind: string): string { return kind === 'entity' ? 'Entity knowledge (customer-specific)' : kind === 'reference' ? 'Reference knowledge (shared)' : 'Operational knowledge (shared)'; }
+  capabilityLabel(id: string): string { return this.catalog?.capabilities.find(item => item.id === id)?.label || id; }
+  capabilityDescription(id: string): string { return this.catalog?.capabilities.find(item => item.id === id)?.description || ''; }
+  initials(name: string): string { return name.split(/\s+/).filter(Boolean).slice(0, 2).map(word => word[0].toUpperCase()).join(''); }
+  composerPlaceholder(): string {
+    if (!this.agent) return 'Ask your documents';
+    const customer = this.conversation ? (this.conversation.entityId ? this.conversationCustomerName() : '') : this.customers.find(item => item.id === this.selectedEntityId)?.name;
+    return customer ? `Ask ${this.agent.name} about ${customer}` : `Ask ${this.agent.name}`;
   }
   scopeLabel(conversation: Conversation): string {
     if (conversation.scopeMode === 'all') return 'Automatic document scope';
@@ -178,8 +272,10 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
     this.selectedDocumentIds = checked ? [...new Set([...this.selectedDocumentIds, id])] : this.selectedDocumentIds.filter(item => item !== id);
   }
   canSend(): boolean {
-    return !!this.draft.trim() && !this.isStreaming && !this.isCreating &&
-      (this.conversation !== null || this.scopeMode === 'all' || (this.scopeMode === 'customer' && !!this.selectedEntityId) || (this.scopeMode === 'documents' && this.selectedDocumentIds.length > 0));
+    if (!this.draft.trim() || this.isStreaming || this.isCreating) return false;
+    if (this.conversation !== null) return true;
+    if (this.agent) return this.agent.customerAccess !== 'required' || !!this.selectedEntityId;
+    return this.scopeMode === 'all' || (this.scopeMode === 'customer' && !!this.selectedEntityId) || (this.scopeMode === 'documents' && this.selectedDocumentIds.length > 0);
   }
   onDraftInput(event: Event): void {
     const input = event.target as HTMLTextAreaElement;
@@ -201,9 +297,15 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
     try {
       if (!this.conversation) {
         this.isCreating = true;
-        const payload: Record<string, unknown> = { scopeMode: this.scopeMode };
-        if (this.scopeMode === 'customer') payload['entityId'] = this.selectedEntityId;
-        if (this.scopeMode === 'documents') payload['documentIds'] = this.selectedDocumentIds;
+        const payload: Record<string, unknown> = {};
+        if (this.agent) {
+          payload['agentId'] = this.agent.id;
+          if (this.selectedEntityId && this.agent.customerAccess !== 'none') payload['entityId'] = this.selectedEntityId;
+        } else {
+          payload['scopeMode'] = this.scopeMode;
+          if (this.scopeMode === 'customer') payload['entityId'] = this.selectedEntityId;
+          if (this.scopeMode === 'documents') payload['documentIds'] = this.selectedDocumentIds;
+        }
         const response = await fetch(`${this.apiUrl}/conversations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         if (!response.ok) throw new Error(await this.responseError(response));
         this.conversation = await response.json() as Conversation;
@@ -291,7 +393,9 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
             const user = this.messages.find(item => item.turnId === turnId && item.role === 'user');
             if (user) user.status = 'completed';
             const userIndex = this.messages.findIndex(item => item.turnId === turnId && item.role === 'user');
-            this.messages.splice(userIndex < 0 ? this.messages.length : userIndex + 1, 0, payload.message as Message);
+            const message = payload.message as Message;
+            this.messages.splice(userIndex < 0 ? this.messages.length : userIndex + 1, 0, message);
+            if (message.context) this.knowledge = message.context;
             this.conversation = payload.conversation as Conversation;
             this.conversationChanged.emit(this.conversation);
             this.scrollToBottom();

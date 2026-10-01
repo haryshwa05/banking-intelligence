@@ -37,7 +37,7 @@ class ChatApiTests(unittest.TestCase):
         self.assertEqual(created.status_code, 201)
         conversation_id = created.json()["id"]
         seen = []
-        with patch.object(main.facts, "answer_with_trace", side_effect=lambda _db, question, ids: (seen.append((question, ids)) or None, {})), patch.object(
+        with patch.object(main.facts, "answer_with_trace", side_effect=lambda _db, question, ids, **_: (seen.append((question, ids)) or None, {})), patch.object(
             main.rag, "retrieve_with_trace", return_value=([], {})
         ), patch.object(main.chat_history, "_claude_text", return_value="What is the value in doc-one?"):
             first = self.client.post(f"/conversations/{conversation_id}/messages/stream", json={"question": "What is the value?", "turnId": "turn-1"})
@@ -91,7 +91,7 @@ class ChatApiTests(unittest.TestCase):
             connection.commit()
         conversation_id = self.client.post("/conversations", json={"scopeMode": "customer", "entityId": customer["id"]}).json()["id"]
         scopes = []
-        with patch.object(main.facts, "answer_with_trace", side_effect=lambda _db, _question, ids: (scopes.append(ids) or None, {})), patch.object(
+        with patch.object(main.facts, "answer_with_trace", side_effect=lambda _db, _question, ids, **_: (scopes.append(ids) or None, {})), patch.object(
             main.rag, "retrieve_with_trace", return_value=([], {})
         ):
             response = self.client.post(f"/conversations/{conversation_id}/messages/stream", json={"question": "What is his salary?"})

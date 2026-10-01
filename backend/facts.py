@@ -155,14 +155,26 @@ class FactEngine:
         result, _ = self.answer_with_trace(connection, question, document_ids)
         return result
 
-    def answer_with_trace(self, connection: sqlite3.Connection, question: str, document_ids: list[str] | None) -> tuple[tuple[str, list[sqlite3.Row]] | None, dict[str, Any]]:
+    def answer_with_trace(self, connection: sqlite3.Connection, question: str, document_ids: list[str] | None, capabilities: set[str] | None = None) -> tuple[tuple[str, list[sqlite3.Row]] | None, dict[str, Any]]:
+        """Answer from structured facts.
+
+        ``capabilities`` restricts which structured routes an agent may use:
+        fact_lookup, calculations, policy_evaluation and customer_profile.
+        ``None`` permits every route (the unscoped legacy chat behaviour).
+        """
+        allowed = (lambda name: True) if capabilities is None else (lambda name: name in capabilities)
         trace: dict[str, Any] = {"route": "structured-facts"}
+        if capabilities is not None:
+            trace["agentCapabilities"] = sorted(capabilities)
         if connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0:
             trace["reason"] = "No structured facts are available yet."
             return None, trace
         concept_plan = self._plan_question_concept(question)
         trace["conceptPlan"] = concept_plan
         concept = concept_plan.get("concept") if isinstance(concept_plan, dict) else "none"
+        if isinstance(concept, str) and concept != "none" and not allowed("fact_lookup"):
+            trace["reason"] = "Direct fact lookup is not enabled for this agent."
+            concept = "none"
         if isinstance(concept, str) and concept != "none":
             concept_rows = self._retrieve_concept(connection, concept, document_ids)
             trace["conceptCandidates"] = [self._trace_fact(row) for row in concept_rows]
@@ -184,8 +196,11 @@ class FactEngine:
         if not fact_rows:
             trace["reason"] = "No fact candidates passed the relevance cutoff."
             return None, trace
-        profile_request = bool(retrieval_trace.get("profileRequest"))
+        profile_request = bool(retrieval_trace.get("profileRequest")) and allowed("customer_profile")
         deterministic_plan = retrieval_trace.get("deterministicFormulaPlan")
+        if isinstance(deterministic_plan, dict) and not allowed("policy_evaluation"):
+            trace["policyEvaluationSkipped"] = "Policy rule evaluation is not enabled for this agent."
+            deterministic_plan = None
         if isinstance(deterministic_plan, dict):
             by_id = {row["id"]: row for row in fact_rows}
             ordered_ids = [
@@ -225,6 +240,12 @@ class FactEngine:
             trace["reason"] = "The fact selector did not choose valid retrieved fact IDs."
             return None, trace
         operation = plan.get("operation")
+        required_capability = {
+            "profile": "customer_profile", "fact_lookup": "fact_lookup", "formula_compare": "policy_evaluation",
+        }.get(str(operation), "calculations")
+        if operation != "none" and not allowed(required_capability):
+            trace["reason"] = f"The {operation!r} route needs the {required_capability} capability, which this agent does not have."
+            return None, trace
         if operation == "profile":
             profile = plan.get("answer")
             if isinstance(profile, str) and profile.strip():

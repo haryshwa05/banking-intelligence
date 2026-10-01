@@ -47,7 +47,7 @@ class ScopeApiTests(unittest.TestCase):
 
         seen: list[list[str] | None] = []
         fact_scopes: list[list[str] | None] = []
-        with patch.object(main.facts, "answer_with_trace", side_effect=lambda _connection, _question, ids: (fact_scopes.append(ids) or None, {})), patch.object(
+        with patch.object(main.facts, "answer_with_trace", side_effect=lambda _connection, _question, ids, **_: (fact_scopes.append(ids) or None, {})), patch.object(
             main.rag, "retrieve_with_trace", side_effect=lambda _connection, _question, ids: (seen.append(ids) or [], {})
         ):
             customer_response = self.client.post("/questions", json={"question": "Where does Peter work?", "entityId": peter["id"]})

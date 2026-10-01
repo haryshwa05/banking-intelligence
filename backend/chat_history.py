@@ -43,8 +43,17 @@ def initialise(connection: sqlite3.Connection) -> None:
             UNIQUE (conversation_id, turn_id, role)
         )
     """)
-    if "attempt_id" not in {row[1] for row in connection.execute("PRAGMA table_info(chat_messages)")}:
+    message_columns = {row[1] for row in connection.execute("PRAGMA table_info(chat_messages)")}
+    if "attempt_id" not in message_columns:
         connection.execute("ALTER TABLE chat_messages ADD COLUMN attempt_id TEXT")
+    # The knowledge an answer was produced from, recorded at answer time so the
+    # chat keeps an honest record even if the agent's access changes later.
+    if "context_json" not in message_columns:
+        connection.execute("ALTER TABLE chat_messages ADD COLUMN context_json TEXT")
+    # Agent chats bind one reusable agent to (optionally) one customer.
+    if "agent_id" not in {row[1] for row in connection.execute("PRAGMA table_info(conversations)")}:
+        connection.execute("ALTER TABLE conversations ADD COLUMN agent_id TEXT")
+    connection.execute("CREATE INDEX IF NOT EXISTS conversations_agent ON conversations(agent_id, updated_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS chat_messages_conversation ON chat_messages(conversation_id, created_at, id)")
     # A restarted server may have interrupted a response mid-stream. The user
     # message remains available for retry, while no partial assistant answer is
@@ -56,6 +65,7 @@ def conversation_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"], "title": row["title"], "scopeMode": row["scope_mode"],
         "entityId": row["entity_id"], "documentIds": json.loads(row["document_ids"] or "[]"),
+        "agentId": row["agent_id"] if "agent_id" in row.keys() else None,
         "createdAt": row["created_at"], "updatedAt": row["updated_at"],
     }
 
@@ -66,6 +76,7 @@ def message_payload(row: sqlite3.Row) -> dict[str, Any]:
         "content": row["content"], "status": row["status"],
         "sources": json.loads(row["sources_json"] or "[]"), "mode": row["mode"],
         "debug": json.loads(row["debug_json"]) if row["debug_json"] else None,
+        "context": json.loads(row["context_json"]) if "context_json" in row.keys() and row["context_json"] else None,
         "createdAt": row["created_at"],
     }
 
