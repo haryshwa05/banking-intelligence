@@ -1,0 +1,42 @@
+Backend 
+
+cd D:\banking-intelligence\backend
+.\run-backend.ps1
+
+
+Frontend 
+
+cd D:\banking-intelligence\frontend
+npm install
+npm start
+
+
+
+Plan:
+
+Stage 1: Basic UI + upload
+upload PDF/image
+display uploaded documents
+
+Stage 2: Document understanding
+PDF → text
+image → multimodal extraction
+scanned PDF → page images → multimodal extraction
+
+Stage 3: RAG
+chunk
+embed
+vector DB
+retrieve
+answer
+
+Stage 4: Evidence
+filename
+page number
+retrieved passage
+
+Stage 5: Multi-document intelligence
+cross-document questions
+comparison
+summaries
+structured extraction

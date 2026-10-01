@@ -1,0 +1,20 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/uploads/
+backend/upload_metadata.db
+backend/ocr_models/
+backend/rag_models/
+backend/vector_store/
+*.py[cod]
+
+# Angular / Node
+frontend/node_modules/
+frontend/dist/
+frontend/.angular/
+
+# Local environment files
+.env
+
+# Tooling caches
+.pytest_cache/
