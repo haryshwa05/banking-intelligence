@@ -56,3 +56,16 @@ export interface KnowledgeInUse {
   sources: KnowledgeSource[];
   documentCount: number;
 }
+
+/** A stable, light colour tone per agent/customer so each is recognisable at a glance. */
+export function toneFor(id: string | null | undefined): string {
+  let hash = 0;
+  for (const character of id || '') hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return `tone-${(hash % 6) + 1}`;
+}
+
+export function initials(name: string): string {
+  return name.split(/\s+/).filter(Boolean).slice(0, 2).map(word => word[0].toUpperCase()).join('');
+}
+
+export const KIND_ICONS: Record<KnowledgeKind, string> = { entity: 'user', reference: 'book', operational: 'checklist' };

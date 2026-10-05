@@ -2,7 +2,7 @@
 backend/.venv/
 backend/__pycache__/
 backend/uploads/
-backend/upload_metadata.db
+backend/upload_metadata.db*
 backend/ocr_models/
 backend/rag_models/
 backend/vector_store/

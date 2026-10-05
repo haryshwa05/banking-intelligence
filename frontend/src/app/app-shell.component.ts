@@ -9,7 +9,7 @@ import { LoginComponent } from './login.component';
 import { AccountMenuComponent } from './account-menu.component';
 import { KnowledgeSpacesComponent } from './knowledge-spaces.component';
 import { AgentBuilderComponent } from './agent-builder.component';
-import { API_URL, Agent, Customer, KnowledgeSpace } from './models';
+import { API_URL, Agent, Customer, KnowledgeSpace, toneFor } from './models';
 
 type View = 'home' | 'chat' | 'knowledge' | 'repository' | 'builder';
 
@@ -28,16 +28,16 @@ type View = 'home' | 'chat' | 'knowledge' | 'repository' | 'builder';
         </div>
         <div class="sidebar-search"><app-icon name="search"></app-icon><input aria-label="Search agents and chats" placeholder="Search" [value]="sidebarQuery" (input)="sidebarQuery = $any($event.target).value"><button *ngIf="sidebarQuery" class="icon-button" type="button" aria-label="Clear search" (click)="sidebarQuery = ''"><app-icon name="close"></app-icon></button></div>
         <nav class="workspace-navigation" aria-label="Workspace">
-          <button class="sidebar-nav-item" type="button" [class.active]="view === 'home'" [attr.aria-current]="view === 'home' ? 'page' : null" (click)="navigate('#/')" data-tooltip="All agents" aria-label="All agents"><app-icon name="home"></app-icon><span>All agents</span></button>
-          <button class="sidebar-nav-item" type="button" [class.active]="view === 'knowledge'" [attr.aria-current]="view === 'knowledge' ? 'page' : null" (click)="navigate('#/knowledge')" data-tooltip="Knowledge Spaces" aria-label="Knowledge Spaces"><app-icon name="folder"></app-icon><span>Knowledge Spaces</span></button>
-          <button class="sidebar-nav-item" type="button" [class.active]="view === 'repository'" [attr.aria-current]="view === 'repository' ? 'page' : null" (click)="openRepository()" data-tooltip="Document Repository" aria-label="Document Repository"><app-icon name="file"></app-icon><span>Document Repository</span></button>
-          <button class="sidebar-nav-item" type="button" [class.active]="view === 'builder'" [attr.aria-current]="view === 'builder' ? 'page' : null" (click)="navigate('#/builder')" data-tooltip="Agent Builder" aria-label="Agent Builder"><app-icon name="workflow"></app-icon><span>Agent Builder</span></button>
+          <button class="sidebar-nav-item nav-home" type="button" [class.active]="view === 'home'" [attr.aria-current]="view === 'home' ? 'page' : null" (click)="navigate('#/')" data-tooltip="All agents" aria-label="All agents"><app-icon name="home"></app-icon><span>All agents</span></button>
+          <button class="sidebar-nav-item nav-knowledge" type="button" [class.active]="view === 'knowledge'" [attr.aria-current]="view === 'knowledge' ? 'page' : null" (click)="navigate('#/knowledge')" data-tooltip="Knowledge Spaces" aria-label="Knowledge Spaces"><app-icon name="folder"></app-icon><span>Knowledge Spaces</span></button>
+          <button class="sidebar-nav-item nav-documents" type="button" [class.active]="view === 'repository'" [attr.aria-current]="view === 'repository' ? 'page' : null" (click)="openRepository()" data-tooltip="Document Repository" aria-label="Document Repository"><app-icon name="file"></app-icon><span>Document Repository</span></button>
+          <button class="sidebar-nav-item nav-builder" type="button" [class.active]="view === 'builder'" [attr.aria-current]="view === 'builder' ? 'page' : null" (click)="navigate('#/builder')" data-tooltip="Agent Builder" aria-label="Agent Builder"><app-icon name="workflow"></app-icon><span>Agent Builder</span></button>
         </nav>
         <div *ngIf="!sidebarCollapsed" class="sidebar-scroll">
           <div class="sidebar-section-label"><span><app-icon name="down"></app-icon> Agents</span><button type="button" class="icon-button" aria-label="Create agent" title="Create agent" (click)="navigate('#/builder/new')"><app-icon name="plus"></app-icon></button></div>
           <div *ngFor="let agent of sidebarAgents()" class="agent-group" [class.active]="activeAgentId === agent.id">
             <button type="button" class="agent-nav" [class.active]="view === 'chat' && activeAgentId === agent.id && (!activeConversationId || sidebarCollapsed)" (click)="newAgentChat(agent.id)" [attr.data-tooltip]="agent.name" [attr.aria-label]="agent.name">
-              <app-icon name="chat"></app-icon><span class="agent-nav-name">{{ agent.name }}</span><app-icon class="agent-new" name="plus"></app-icon>
+              <span [class]="'agent-dot ' + tone(agent.id)"><app-icon name="agent"></app-icon></span><span class="agent-nav-name">{{ agent.name }}</span><app-icon class="agent-new" name="plus"></app-icon>
             </button>
             <div *ngIf="activeAgentId === agent.id || expandedAgentIds.has(agent.id) || sidebarQuery" class="agent-chats">
               <div *ngFor="let item of sidebarChats(agent.id)" class="conversation-entry" [class.active]="view === 'chat' && activeConversationId === item.id">
@@ -46,6 +46,7 @@ type View = 'home' | 'chat' | 'knowledge' | 'repository' | 'builder';
                 <button type="button" class="conversation-menu" aria-label="Delete conversation" title="Delete" (click)="deleteConversation(item)"><app-icon name="trash"></app-icon></button>
               </div>
               <p *ngIf="!chatsFor(agent.id).length" class="agent-chats-empty">No chats yet</p>
+              <button *ngIf="chatsFor(agent.id).length > 1 && !sidebarQuery" type="button" class="agent-clear" (click)="deleteAllChats(agent.id, agent.name)"><app-icon name="trash"></app-icon>Delete all {{ chatsFor(agent.id).length }} chats</button>
             </div>
             <button *ngIf="activeAgentId !== agent.id && chatsFor(agent.id).length" type="button" class="agent-expand" (click)="toggleAgent(agent.id)">{{ expandedAgentIds.has(agent.id) ? 'Hide' : 'Show' }} {{ chatsFor(agent.id).length }} chat{{ chatsFor(agent.id).length === 1 ? '' : 's' }}</button>
           </div>
@@ -55,15 +56,17 @@ type View = 'home' | 'chat' | 'knowledge' | 'repository' | 'builder';
             <ng-container *ngIf="showLegacy || sidebarQuery">
               <div *ngFor="let item of sidebarChats(null)" class="conversation-entry" [class.active]="view === 'chat' && activeConversationId === item.id">
                 <button type="button" class="conversation-open" (click)="openConversation(item)" [title]="item.title"><span>{{ item.title }}</span><small>Before agents</small></button>
+                <button type="button" class="conversation-menu" aria-label="Rename conversation" title="Rename" (click)="renameConversation(item)"><app-icon name="edit"></app-icon></button>
                 <button type="button" class="conversation-menu" aria-label="Delete conversation" title="Delete" (click)="deleteConversation(item)"><app-icon name="trash"></app-icon></button>
               </div>
+              <button *ngIf="legacyChats().length > 1 && !sidebarQuery" type="button" class="agent-clear" (click)="deleteAllChats(null, 'earlier')"><app-icon name="trash"></app-icon>Delete all earlier chats</button>
             </ng-container>
           </ng-container>
         </div>
         <div *ngIf="sidebarCollapsed && !sidebarOpen" class="sidebar-agent-shortcut">
           <button type="button" class="sidebar-nav-item" [class.active]="view === 'chat'" aria-label="Expand agents and chats" data-tooltip="Agents &amp; chats" aria-controls="main-sidebar" (click)="sidebarCollapsed = false"><app-icon name="chat"></app-icon></button>
         </div>
-        <div class="sidebar-footer"><span class="storage-label"><span class="local-dot"></span> Local document storage</span><button type="button" class="icon-button sidebar-collapse" [attr.aria-label]="sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'" [attr.aria-expanded]="!sidebarCollapsed" aria-controls="main-sidebar" [attr.data-tooltip]="sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'" (click)="sidebarCollapsed = !sidebarCollapsed"><app-icon name="panel"></app-icon></button></div>
+        <div class="sidebar-footer"><button type="button" class="icon-button sidebar-collapse" [attr.aria-label]="sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'" [attr.aria-expanded]="!sidebarCollapsed" aria-controls="main-sidebar" [attr.data-tooltip]="sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'" (click)="sidebarCollapsed = !sidebarCollapsed"><app-icon name="panel"></app-icon></button></div>
       </aside>
 
       <main class="main-surface" [class.repository-view]="view !== 'chat'">
@@ -78,26 +81,26 @@ type View = 'home' | 'chat' | 'knowledge' | 'repository' | 'builder';
           <div class="view-controls"><div class="segmented-control" aria-label="Agent views"><button type="button" class="selected" aria-current="page">All agents <span class="count-pill">{{ agents.length }}</span></button><button type="button" (click)="navigate('#/builder')">Manage agents</button></div></div>
           <div class="agent-board"><div class="board-heading"><span class="board-accent"></span><span>Your agents</span><span class="count-pill">{{ agents.length }}</span><button type="button" class="icon-button" aria-label="Add agent" (click)="navigate('#/builder/new')"><app-icon name="plus"></app-icon></button></div>
           <div class="agent-card-grid">
-            <article *ngFor="let agent of agents" class="agent-card">
-              <div class="agent-card-topline"><span>{{ agent.builtIn ? 'Built-in agent' : 'Custom agent' }}</span><app-icon name="agent"></app-icon></div>
-              <header><div><h2>{{ agent.name }}</h2><p>{{ agent.purpose }}</p></div></header>
+            <article *ngFor="let agent of agents" [class]="'agent-card ' + tone(agent.id)">
+              <div class="agent-card-topline"><span class="agent-card-badge">{{ agent.builtIn ? 'Built-in agent' : 'Custom agent' }}</span><button type="button" class="icon-button danger" [attr.aria-label]="'Delete ' + agent.name" title="Delete agent" (click)="deleteAgent(agent)"><app-icon name="trash"></app-icon></button></div>
+              <header><span class="agent-avatar"><app-icon name="agent"></app-icon></span><div><h2>{{ agent.name }}</h2><p>{{ agent.purpose }}</p></div></header>
               <div class="agent-card-section"><small>Knowledge access</small>
                 <div class="knowledge-chips">
                   <span *ngIf="agent.customerAccess !== 'none'" class="knowledge-chip kind-entity">Selected customer's documents{{ agent.customerAccess === 'optional' ? ' (optional)' : '' }}</span>
                   <span *ngFor="let space of spacesFor(agent)" class="knowledge-chip" [class]="'knowledge-chip kind-' + space.kind">{{ space.name }}</span>
                 </div>
               </div>
-              <footer><span class="card-chat-count"><app-icon name="chat"></app-icon>{{ agent.conversationCount }} chat{{ agent.conversationCount === 1 ? '' : 's' }}</span><div><button type="button" class="link-button" (click)="navigate('#/builder/' + agent.id)">View setup</button><button type="button" class="primary-button" (click)="newAgentChat(agent.id)">Start chat</button></div></footer>
+              <footer><span class="card-chat-count"><app-icon name="chat"></app-icon>{{ agent.conversationCount }} chat{{ agent.conversationCount === 1 ? '' : 's' }}<button *ngIf="agent.conversationCount" type="button" class="link-button danger small" (click)="deleteAllChats(agent.id, agent.name)">Clear</button></span><div><button type="button" class="link-button" (click)="navigate('#/builder/' + agent.id)">View setup</button><button type="button" class="primary-button" (click)="newAgentChat(agent.id)">Start chat</button></div></footer>
             </article>
           </div>
           </div>
         </section>
 
         <div *ngIf="view === 'chat' && activeAgentId && !activeAgent()" class="chat-empty">{{ agentsLoaded ? "This agent no longer exists." : "Loading agent…" }}</div>
-        <app-chat *ngIf="view === 'chat' && (!activeAgentId || activeAgent())"[conversationId]="activeConversationId" [agent]="activeAgent()" [initialEntityId]="initialEntityId" [spaces]="spaces" [displayTitle]="activeConversationTitle()" (conversationChanged)="conversationChanged($event)" (sourceOpened)="openSource($event)" (repositoryOpened)="openRepository()"></app-chat>
-        <app-knowledge-spaces *ngIf="view === 'knowledge'" [agents]="agents" (documentOpened)="openSource($event)" (chatStarted)="startCustomerChat($event.agentId, $event.entityId)" (spacesChanged)="loadSpaces()"></app-knowledge-spaces>
+        <app-chat *ngIf="view === 'chat' && (!activeAgentId || activeAgent())"[conversationId]="activeConversationId" [agent]="activeAgent()" [initialEntityId]="initialEntityId" [spaces]="spaces" [displayTitle]="activeConversationTitle()" (conversationChanged)="conversationChanged($event)" (conversationDeleted)="chatDeleted($event)" (sourceOpened)="openSource($event)" (repositoryOpened)="openRepository()"></app-chat>
+        <app-knowledge-spaces *ngIf="view === 'knowledge'" [agents]="agents" (documentOpened)="openSource($event)" (chatStarted)="startCustomerChat($event.agentId, $event.entityId)" (spacesChanged)="loadSpaces(); loadAgents()" (customersChanged)="refreshConversations()"></app-knowledge-spaces>
         <app-document-repository *ngIf="view === 'repository'" [previewDocumentId]="previewDocumentId" (knowledgeChanged)="loadSpaces()"></app-document-repository>
-        <app-agent-builder *ngIf="view === 'builder'" [editAgentId]="builderAgentId" (agentsChanged)="loadAgents()" (chatStarted)="newAgentChat($event)" (closed)="navigate('#/builder')"></app-agent-builder>
+        <app-agent-builder *ngIf="view === 'builder'" [editAgentId]="builderAgentId" (agentsChanged)="loadAgents(); refreshConversations()" (chatStarted)="newAgentChat($event)" (closed)="navigate('#/builder')"></app-agent-builder>
         </div>
       </main>
     </div>
@@ -239,11 +242,43 @@ export class AppShellComponent implements OnInit, OnDestroy {
       next: updated => this.conversations = this.conversations.map(item => item.id === updated.id ? updated : item)
     });
   }
+  tone(id: string): string { return toneFor(id); }
+  chatDeleted(conversation: Conversation): void {
+    this.conversations = this.conversations.filter(item => item.id !== conversation.id);
+    this.loadAgents();
+    conversation.agentId ? this.newAgentChat(conversation.agentId) : this.navigate('#/');
+  }
+  deleteAllChats(agentId: string | null, label: string): void {
+    const chats = agentId ? this.chatsFor(agentId) : this.legacyChats();
+    const what = agentId ? `all ${chats.length} chats with ${label}` : `all ${chats.length} earlier chats`;
+    if (!chats.length || !window.confirm(`Delete ${what}? This cannot be undone.`)) return;
+    this.http.delete(`${API_URL}/conversations?agentId=${encodeURIComponent(agentId || 'none')}`).subscribe({
+      next: () => {
+        const removed = new Set(chats.map(item => item.id));
+        this.conversations = this.conversations.filter(item => !removed.has(item.id));
+        this.loadAgents();
+        if (this.activeConversationId && removed.has(this.activeConversationId)) agentId ? this.newAgentChat(agentId) : this.navigate('#/');
+      }
+    });
+  }
+  deleteAgent(agent: Agent): void {
+    const chats = agent.conversationCount ? ` Its ${agent.conversationCount} chat${agent.conversationCount === 1 ? '' : 's'} will also be deleted.` : '';
+    const builtIn = agent.builtIn ? ' This is a built-in agent and will not be recreated.' : '';
+    if (!window.confirm(`Delete the agent "${agent.name}"?${chats}${builtIn} This cannot be undone.`)) return;
+    this.http.delete(`${API_URL}/agents/${encodeURIComponent(agent.id)}`).subscribe({
+      next: () => {
+        this.agents = this.agents.filter(item => item.id !== agent.id);
+        this.conversations = this.conversations.filter(item => item.agentId !== agent.id);
+        if (this.activeAgentId === agent.id) this.navigate('#/');
+      }
+    });
+  }
   deleteConversation(conversation: Conversation): void {
     if (!window.confirm(`Delete chat "${conversation.title}"? This cannot be undone.`)) return;
     this.http.delete(`${API_URL}/conversations/${conversation.id}`).subscribe({
       next: () => {
         this.conversations = this.conversations.filter(item => item.id !== conversation.id);
+        this.loadAgents();
         if (this.activeConversationId === conversation.id) conversation.agentId ? this.newAgentChat(conversation.agentId) : this.navigate('#/');
       }
     });

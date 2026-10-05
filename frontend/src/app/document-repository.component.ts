@@ -79,22 +79,29 @@ interface DocumentFacts {
             </select>
           </label>
           <span *ngIf="selectedFiles.length" class="upload-size">{{ formatBytes(selectedFilesSize()) }}</span>
+          <button *ngIf="selectedFiles.length && !isUploading" type="button" class="icon-button" title="Clear selected files" aria-label="Clear selected files" (click)="setFiles([])"><app-icon name="close"></app-icon></button>
           <button *ngIf="selectedFiles.length" type="button" class="submit-upload" [disabled]="isUploading" (click)="upload()">{{ isUploading ? 'Uploading ' + uploadProgress + ' of ' + selectedFiles.length : 'Upload ' + selectedFiles.length + (selectedFiles.length === 1 ? ' file' : ' files') }}</button>
         </div>
         <p *ngIf="error" class="error-banner">{{ error }}</p>
 
+        <div *ngIf="selectedIds.size" class="selection-bar">
+          <span><strong>{{ selectedIds.size }}</strong> selected</span>
+          <button type="button" class="link-button" (click)="selectedIds.clear()">Clear selection</button>
+          <button type="button" class="danger-button" [disabled]="isBulkDeleting" (click)="deleteSelected()"><app-icon name="trash"></app-icon>{{ isBulkDeleting ? 'Deleting…' : 'Delete selected' }}</button>
+        </div>
+
         <section class="document-table">
-          <div class="table-heading"><span>Name</span><span>Type</span><span>Knowledge context</span><span>Status</span><span>Uploaded</span><span></span></div>
+          <div class="table-heading"><span class="name-heading"><input type="checkbox" aria-label="Select all documents" [checked]="documents.length > 0 && selectedIds.size === documents.length" [indeterminate]="selectedIds.size > 0 && selectedIds.size < documents.length" (change)="toggleAll($any($event.target).checked)">Name</span><span>Type</span><span>Knowledge context</span><span>Status</span><span>Uploaded</span><span></span></div>
           <div *ngIf="isLoading" class="empty-table">Loading documents...</div>
           <div *ngIf="!isLoading && documents.length === 0" class="empty-table">No documents uploaded.</div>
-          <button class="document-row" type="button" *ngFor="let document of documents" (click)="openDetails(document)">
-            <span class="name-cell"><span class="file-icon" [class.image]="document.type.startsWith('image/')"><app-icon [name]="document.type.startsWith('image/') ? 'image' : 'file'"></app-icon></span><span class="document-name">{{ document.name }}<small>{{ formatBytes(document.sizeBytes) }}</small></span></span>
+          <div class="document-row" role="button" tabindex="0" *ngFor="let document of documents" [class.selected]="selectedIds.has(document.id)" (click)="openDetails(document)" (keydown.enter)="openDetails(document)">
+            <span class="name-cell"><input type="checkbox" [attr.aria-label]="'Select ' + document.name" [checked]="selectedIds.has(document.id)" (click)="$event.stopPropagation()" (change)="toggleSelect(document.id, $any($event.target).checked)"><span class="file-icon" [class.image]="document.type.startsWith('image/')"><app-icon [name]="document.type.startsWith('image/') ? 'image' : 'file'"></app-icon></span><span class="document-name">{{ document.name }}<small>{{ formatBytes(document.sizeBytes) }}</small></span></span>
             <span class="document-type">{{ fileType(document.type) }}</span>
             <span class="document-owner" [class.review]="document.knowledgeKind === 'entity' && (document.entityStatus === 'needs_review' || document.entityStatus === 'failed')"><span [class]="'kind-dot kind-' + document.knowledgeKind" [title]="kindLabels[document.knowledgeKind]"></span>{{ knowledgeLabel(document) }}</span>
             <span class="status-badge" [class]="'status-' + document.extractionStatus">{{ statusLabel(document.extractionStatus) }}</span>
             <span class="document-date">{{ document.uploadedAt | date:'mediumDate' }}</span>
-            <span class="row-arrow"><app-icon name="arrow"></app-icon></span>
-          </button>
+            <button type="button" class="icon-button danger row-delete" [attr.aria-label]="'Delete ' + document.name" title="Delete document" (click)="$event.stopPropagation(); deleteRow(document)"><app-icon name="trash"></app-icon></button>
+          </div>
         </section>
       </section>
 
@@ -111,6 +118,7 @@ interface DocumentFacts {
         </section>
         <section *ngIf="activeDocument.knowledgeKind === 'entity'" class="ownership-state" [class.review]="activeDocument.entityStatus === 'needs_review' || activeDocument.entityStatus === 'failed'">
           <span>Customer ownership</span><strong>{{ entityLabel(activeDocument) }}</strong><small *ngIf="activeDocument.entityReason">{{ activeDocument.entityReason }}</small>
+          <button *ngIf="activeDocument.entityStatus === 'linked'" type="button" class="link-button danger ownership-remove" [disabled]="isAssigning" (click)="removeFromCustomer()"><app-icon name="unlink"></app-icon>Remove from {{ activeDocument.entityName || 'customer' }}</button>
         </section>
         <div *ngIf="activeDocument.knowledgeKind === 'entity' && activeDocument.entityStatus !== 'queued' && activeDocument.entityStatus !== 'processing'" class="ownership-editor">
           <label for="assign-customer">Assign to customer</label>
@@ -119,7 +127,7 @@ interface DocumentFacts {
           <div class="ownership-controls"><input aria-label="New customer name" placeholder="Or create a new customer" [value]="newCustomerName" (input)="newCustomerName = $any($event.target).value" [disabled]="isAssigning"><button type="button" (click)="createAndAssignCustomer()" [disabled]="isAssigning || newCustomerName.trim().length < 2">Create &amp; assign</button></div>
           <small *ngIf="ownershipError" class="ownership-error">{{ ownershipError }}</small>
         </div>
-        <div class="detail-actions"><a [href]="fileUrl(activeDocument)" target="_blank" rel="noopener">Open in new tab</a><button type="button" class="delete-button" [disabled]="isDeleting" (click)="deleteDocument()">{{ isDeleting ? 'Deleting...' : 'Delete' }}</button></div>
+        <div class="detail-actions"><a [href]="fileUrl(activeDocument)" target="_blank" rel="noopener">Open in new tab</a><button type="button" class="delete-button" [disabled]="isDeleting" (click)="deleteDocument()"><app-icon name="trash"></app-icon>{{ isDeleting ? 'Deleting...' : 'Delete document' }}</button></div>
 
         <section class="original-preview">
           <div class="preview-heading">Original document</div>
@@ -161,6 +169,8 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
   private pollingTimer: ReturnType<typeof setTimeout> | null = null;
   private listRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   documents: UploadedDocument[] = [];
+  selectedIds = new Set<string>();
+  isBulkDeleting = false;
   customers: Customer[] = [];
   selectedFiles: File[] = [];
   activeDocument: UploadedDocument | null = null;
@@ -215,6 +225,7 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
     this.http.get<UploadedDocument[]>(`${this.apiUrl}/uploads`).subscribe({
       next: (documents) => {
         this.documents = documents;
+        this.selectedIds = new Set(documents.filter((document) => this.selectedIds.has(document.id)).map((document) => document.id));
         this.isLoading = false;
         if (this.previewDocumentId && this.activeDocument?.id !== this.previewDocumentId) {
           const preview = documents.find((document) => document.id === this.previewDocumentId);
@@ -307,12 +318,57 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
     });
   }
 
+  toggleSelect(id: string, checked: boolean): void { checked ? this.selectedIds.add(id) : this.selectedIds.delete(id); }
+  toggleAll(checked: boolean): void { this.selectedIds = new Set(checked ? this.documents.map((document) => document.id) : []); }
+  deleteRow(document: UploadedDocument): void {
+    if (!window.confirm(`Delete "${document.name}"? This cannot be undone.`)) return;
+    this.http.delete(`${this.apiUrl}/uploads/${document.id}`).subscribe({
+      next: () => { this.documents = this.documents.filter((item) => item.id !== document.id); this.selectedIds.delete(document.id); this.loadCustomers(); this.knowledgeChanged.emit(); },
+      error: (response) => this.error = response.error?.detail || 'The document could not be deleted.'
+    });
+  }
+  deleteSelected(): void {
+    const ids = [...this.selectedIds];
+    if (!ids.length || !window.confirm(`Delete ${ids.length} document${ids.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    this.isBulkDeleting = true;
+    const failures: string[] = [];
+    const next = (index: number): void => {
+      if (index >= ids.length) {
+        this.isBulkDeleting = false;
+        this.selectedIds = new Set(failures);
+        if (failures.length) this.error = `${failures.length} document(s) could not be deleted. They may still be processing; try again shortly.`;
+        this.loadCustomers(); this.knowledgeChanged.emit();
+        return;
+      }
+      this.http.delete(`${this.apiUrl}/uploads/${ids[index]}`).subscribe({
+        next: () => { this.documents = this.documents.filter((item) => item.id !== ids[index]); next(index + 1); },
+        error: () => { failures.push(ids[index]); next(index + 1); }
+      });
+    };
+    next(0);
+  }
+  removeFromCustomer(): void {
+    const document = this.activeDocument;
+    if (!document || !window.confirm(`Remove "${document.name}" from ${document.entityName || 'its customer'}? The document is kept and becomes unassigned.`)) return;
+    this.isAssigning = true;
+    this.ownershipError = '';
+    this.http.delete<UploadedDocument>(`${this.apiUrl}/uploads/${document.id}/entity`).subscribe({
+      next: (updated) => {
+        this.isAssigning = false;
+        this.assignmentEntityId = '';
+        if (this.activeDocument?.id === updated.id) this.activeDocument = updated;
+        this.documents = this.documents.map((item) => item.id === updated.id ? updated : item);
+        this.loadCustomers();
+      },
+      error: (response) => { this.isAssigning = false; this.ownershipError = response.error?.detail || 'Could not remove the document from its customer.'; }
+    });
+  }
   deleteDocument(): void {
     if (!this.activeDocument || !window.confirm(`Delete "${this.activeDocument.name}"? This cannot be undone.`)) return;
     const documentId = this.activeDocument.id;
     this.isDeleting = true;
     this.http.delete(`${this.apiUrl}/uploads/${documentId}`).subscribe({
-      next: () => { this.documents = this.documents.filter((document) => document.id !== documentId); this.isDeleting = false; this.closeDetails(); this.loadCustomers(); },
+      next: () => { this.documents = this.documents.filter((document) => document.id !== documentId); this.selectedIds.delete(documentId); this.isDeleting = false; this.closeDetails(); this.loadCustomers(); this.knowledgeChanged.emit(); },
       error: (response) => { this.isDeleting = false; this.error = response.error?.detail || 'The document could not be deleted.'; }
     });
   }
@@ -402,7 +458,7 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
     return this.selectedFiles.length === 1 ? this.selectedFiles[0].name : `${this.selectedFiles.length} files selected`;
   }
   selectedFilesSize(): number { return this.selectedFiles.reduce((total, file) => total + file.size, 0); }
-  private setFiles(files: File[]): void { this.selectedFiles = files; this.uploadProgress = 0; this.error = ''; }
+  setFiles(files: File[]): void { this.selectedFiles = files; this.uploadProgress = 0; this.error = ''; }
   retryFacts(): void {
     if (!this.activeDocument) return;
     this.http.post<{ status: string }>(`${this.apiUrl}/uploads/${this.activeDocument.id}/facts/retry`, {}).subscribe({

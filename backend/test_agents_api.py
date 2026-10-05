@@ -202,9 +202,47 @@ class AgentKnowledgeTests(unittest.TestCase):
         self.assertEqual([source["name"] for source in preview["sources"]], ["Tony Stark Documents", "Loan Review Procedures"])
         chat = self._chat(agent["id"], self.tony["id"])
         self.assertEqual([item["id"] for item in self.client.get("/conversations", params={"agentId": agent["id"]}).json()], [chat["id"]])
-        self.assertEqual(self.client.delete("/agents/compliance-analyst").status_code, 409)
         self.assertEqual(self.client.delete(f"/agents/{agent['id']}").status_code, 204)
         self.assertEqual(self.client.get(f"/conversations/{chat['id']}").status_code, 404)
+
+    def test_deleting_a_customer_unassigns_documents_and_removes_their_chats(self) -> None:
+        tony_chat = self._chat("customer-document-analyst", self.tony["id"])
+        bruce_chat = self._chat("customer-document-analyst", self.bruce["id"])
+        renamed = self.client.patch(f"/entities/{self.tony['id']}", json={"name": "Anthony Stark"})
+        self.assertEqual(renamed.json()["name"], "Anthony Stark")
+        result = self.client.delete(f"/entities/{self.tony['id']}").json()
+        self.assertEqual(result, {"unassignedDocuments": 2, "deletedChats": 1})
+        documents = {item["id"]: item for item in self.client.get("/uploads").json()}
+        self.assertIsNone(documents["tony-app"]["entityId"])
+        self.assertEqual(documents["tony-app"]["entityStatus"], "needs_review")
+        self.assertEqual(self.client.get(f"/conversations/{tony_chat['id']}").status_code, 404)
+        self.assertEqual(self.client.get(f"/conversations/{bruce_chat['id']}").status_code, 200)
+        self.assertEqual(self.client.delete(f"/entities/{self.tony['id']}").status_code, 404)
+
+    def test_document_can_be_removed_from_its_customer(self) -> None:
+        response = self.client.delete("/uploads/tony-slip/entity")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["entityId"])
+        chat = self._chat("customer-document-analyst", self.tony["id"])
+        _, scopes, _ = self._ask(chat["id"], "What is the salary?")
+        self.assertEqual(scopes[0][0], ["tony-app"])
+
+    def test_space_can_be_deleted_by_moving_documents_back_to_customer_knowledge(self) -> None:
+        self.assertEqual(self.client.delete("/knowledge/spaces/lending-policies").status_code, 409)
+        self.assertEqual(self.client.delete("/knowledge/spaces/lending-policies", params={"moveDocuments": "true"}).status_code, 204)
+        document = next(item for item in self.client.get("/uploads").json() if item["id"] == "loan-policy")
+        self.assertEqual(document["knowledgeKind"], "entity")
+        loan = self.client.get("/agents/loan-eligibility-analyst").json()
+        self.assertEqual(loan["spaceIds"], [])
+
+    def test_all_chats_of_an_agent_can_be_deleted_and_built_in_agents_deleted(self) -> None:
+        self._chat("loan-eligibility-analyst", self.tony["id"])
+        self._chat("loan-eligibility-analyst", self.bruce["id"])
+        keep = self._chat("customer-document-analyst", self.tony["id"])
+        self.assertEqual(self.client.delete("/conversations", params={"agentId": "loan-eligibility-analyst"}).json(), {"deletedChats": 2})
+        self.assertEqual([item["id"] for item in self.client.get("/conversations").json()], [keep["id"]])
+        self.assertEqual(self.client.delete("/agents/compliance-analyst").status_code, 204)
+        self.assertNotIn("compliance-analyst", [item["id"] for item in self.client.get("/agents").json()])
 
     def test_upload_can_be_filed_directly_into_a_shared_space(self) -> None:
         response = self.client.post("/uploads", files={"file": ("aml.txt", b"AML policy", "text/plain")}, data={"spaceId": "compliance-regulatory"})

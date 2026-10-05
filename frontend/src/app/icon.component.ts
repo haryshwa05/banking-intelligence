@@ -45,7 +45,12 @@ export class IconComponent {
     info: ['M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0ZM12 11v6M12 7h.01'],
     book: ['M12 5v16M12 5C9 3 5 3 2 4v16c3-1 7-1 10 1 3-2 7-2 10-1V4c-3-1-7-1-10 1Z'],
     checklist: ['M9 5h12M9 12h12M9 19h12M2 5l1 1 2-2M2 12l1 1 2-2M2 19l1 1 2-2'],
-    more: ['M12 5h.01M12 12h.01M12 19h.01']
+    more: ['M12 5h.01M12 12h.01M12 19h.01'],
+    lock: ['M6 11h12a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1Z', 'M8 11V7a4 4 0 0 1 8 0v4'],
+    shield: ['M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6Z', 'm9 12 2 2 4-4'],
+    sparkle: ['M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6'],
+    unlink: ['M9 15 15 9', 'M11 6l1-1a4 4 0 0 1 6 6l-1 1M13 18l-1 1a4 4 0 0 1-6-6l1-1', 'M3 3l18 18'],
+    undo: ['M9 14 4 9l5-5', 'M4 9h11a5 5 0 0 1 0 10h-3']
   };
   get paths(): string[] { return this.icons[this.name] || this.icons['file']; }
 }

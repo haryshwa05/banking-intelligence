@@ -2,7 +2,7 @@ import { IconComponent } from './icon.component';
 import { CommonModule } from '@angular/common';
 import { HttpClient, HttpClientModule } from '@angular/common/http';
 import { Component, EventEmitter, Input, OnChanges, OnInit, Output } from '@angular/core';
-import { API_URL, Agent, AgentCatalog, CUSTOMER_ACCESS_LABELS, CustomerAccess, KIND_LABELS, KnowledgeSpace } from './models';
+import { API_URL, Agent, AgentCatalog, CUSTOMER_ACCESS_LABELS, CustomerAccess, KIND_LABELS, KnowledgeSpace, toneFor } from './models';
 
 interface AgentDraft {
   name: string; purpose: string; description: string; instructions: string; model: string;
@@ -23,11 +23,16 @@ interface AgentDraft {
       <section class="document-table builder-table">
         <div class="table-heading builder-row"><span>Agent</span><span>Customer documents</span><span>Shared knowledge</span><span>Capabilities</span><span></span></div>
         <div *ngFor="let agent of agents" class="builder-row">
-          <span class="builder-name"><strong>{{ agent.name }}</strong><small>{{ agent.purpose }}</small><em *ngIf="agent.builtIn">Built-in</em></span>
+          <span class="builder-name"><span [class]="'agent-avatar ' + tone(agent.id)"><app-icon name="agent"></app-icon></span><span><strong>{{ agent.name }}</strong><small>{{ agent.purpose }}</small><em *ngIf="agent.builtIn">Built-in</em></span></span>
           <span>{{ accessLabels[agent.customerAccess] }}</span>
           <span>{{ spaceNames(agent.spaceIds) || 'None' }}</span>
           <span>{{ agent.capabilities.length }} of {{ catalog?.capabilities?.length || 0 }}</span>
-          <span class="builder-actions"><button type="button" class="link-button" (click)="chatStarted.emit(agent.id)">Chat</button><button type="button" class="link-button" (click)="open(agent.id)">Edit</button><button *ngIf="!agent.builtIn" type="button" class="link-button danger" (click)="remove(agent)">Delete</button></span>
+          <span class="builder-actions">
+            <button type="button" class="icon-button" title="Start chat" aria-label="Start chat" (click)="chatStarted.emit(agent.id)"><app-icon name="chat"></app-icon></button>
+            <button type="button" class="icon-button" title="Edit agent" aria-label="Edit agent" (click)="open(agent.id)"><app-icon name="edit"></app-icon></button>
+            <button *ngIf="agent.conversationCount" type="button" class="icon-button" [title]="'Delete all ' + agent.conversationCount + ' chats'" aria-label="Delete all chats" (click)="clearChats(agent)"><app-icon name="undo"></app-icon></button>
+            <button type="button" class="icon-button danger" title="Delete agent" aria-label="Delete agent" (click)="remove(agent)"><app-icon name="trash"></app-icon></button>
+          </span>
         </div>
       </section>
     </section>
@@ -90,7 +95,7 @@ interface AgentDraft {
             </label>
           </fieldset>
 
-          <div class="form-actions"><button type="button" class="link-button" (click)="closed.emit()">Cancel</button><button type="submit" class="primary-button" [disabled]="isSaving || !canSave()">{{ isSaving ? 'Saving…' : editAgentId === 'new' ? 'Create agent' : 'Save changes' }}</button></div>
+          <div class="form-actions"><button *ngIf="original" type="button" class="link-button danger push-left" (click)="remove(original)"><app-icon name="trash"></app-icon>Delete agent</button><button type="button" class="link-button" (click)="closed.emit()">Cancel</button><button type="submit" class="primary-button" [disabled]="isSaving || !canSave()">{{ isSaving ? 'Saving…' : editAgentId === 'new' ? 'Create agent' : 'Save changes' }}</button></div>
         </form>
 
         <aside class="builder-summary">
@@ -190,11 +195,20 @@ export class AgentBuilderComponent implements OnInit, OnChanges {
       error: response => { this.isSaving = false; this.error = response.error?.detail || 'Could not save the agent.'; }
     });
   }
+  tone(id: string): string { return toneFor(id); }
+  clearChats(agent: Agent): void {
+    if (!window.confirm(`Delete all ${agent.conversationCount} chats with ${agent.name}? The agent itself is kept. This cannot be undone.`)) return;
+    this.http.delete(`${API_URL}/conversations?agentId=${encodeURIComponent(agent.id)}`).subscribe({
+      next: () => { this.agentsChanged.emit(); this.loadAgents(); },
+      error: () => this.error = 'Could not delete the chats.'
+    });
+  }
   remove(agent: Agent): void {
     const chats = agent.conversationCount ? ` Its ${agent.conversationCount} chat${agent.conversationCount === 1 ? '' : 's'} will also be deleted.` : '';
-    if (!window.confirm(`Delete the agent "${agent.name}"?${chats} This cannot be undone.`)) return;
+    const builtIn = agent.builtIn ? ' This is a built-in agent and will not be recreated.' : '';
+    if (!window.confirm(`Delete the agent "${agent.name}"?${chats}${builtIn} This cannot be undone.`)) return;
     this.http.delete(`${API_URL}/agents/${encodeURIComponent(agent.id)}`).subscribe({
-      next: () => { this.agentsChanged.emit(); this.loadAgents(); },
+      next: () => { const editing = !!this.original; this.draft = null; this.original = null; this.agentsChanged.emit(); this.loadAgents(); if (editing) this.closed.emit(); },
       error: response => this.error = response.error?.detail || 'Could not delete the agent.'
     });
   }

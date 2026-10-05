@@ -437,6 +437,58 @@ def create_entity(payload: dict[str, object]) -> dict[str, object]:
     return {"id": entity_id, "name": name.strip(), "documentCount": 0}
 
 
+@app.patch("/entities/{entity_id}")
+def rename_entity(entity_id: str, payload: dict[str, object]) -> dict[str, object]:
+    name = payload.get("name")
+    if not isinstance(name, str) or not 2 <= len(name.strip()) <= 160:
+        raise HTTPException(status_code=400, detail="Customer name must be between 2 and 160 characters.")
+    with closing(get_connection()) as connection:
+        if connection.execute("SELECT 1 FROM entities WHERE id=?", (entity_id,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail="Customer not found.")
+        connection.execute("UPDATE entities SET display_name=?, updated_at=? WHERE id=?", (name.strip(), utc_now(), entity_id))
+        connection.commit()
+        return next(item for item in entities.list_entities(connection) if item["id"] == entity_id)
+
+
+@app.delete("/entities/{entity_id}")
+def delete_entity(entity_id: str) -> dict[str, int]:
+    """Delete a customer record. Its documents are kept but become unassigned,
+    and chats bound to this customer are deleted because they cannot be answered."""
+    with closing(get_connection()) as connection:
+        if connection.execute("SELECT 1 FROM entities WHERE id=?", (entity_id,)).fetchone() is None:
+            raise HTTPException(status_code=404, detail="Customer not found.")
+        if connection.execute("SELECT 1 FROM document_entity_links WHERE entity_id=? AND status='processing'", (entity_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="Customer resolution is still processing. Try again shortly.")
+        unlinked = connection.execute(
+            """UPDATE document_entity_links SET entity_id=NULL, status='needs_review', confidence=NULL,
+            reason='Its customer was deleted. Assign a customer or file it into a shared space.', resolved_at=?
+            WHERE entity_id=?""",
+            (utc_now(), entity_id),
+        ).rowcount
+        chats = connection.execute("DELETE FROM conversations WHERE entity_id=?", (entity_id,)).rowcount
+        connection.execute("DELETE FROM entity_identifiers WHERE entity_id=?", (entity_id,))
+        connection.execute("DELETE FROM entities WHERE id=?", (entity_id,))
+        connection.commit()
+    return {"unassignedDocuments": unlinked, "deletedChats": chats}
+
+
+@app.delete("/uploads/{upload_id}/entity")
+def unassign_upload_entity(upload_id: str) -> dict[str, str | int | None]:
+    """Remove a document from its customer without deleting the document."""
+    upload = get_upload(upload_id)
+    if upload["entity_status"] in {"queued", "processing"}:
+        raise HTTPException(status_code=409, detail="Customer resolution is in progress. Try again shortly.")
+    with closing(get_connection()) as connection:
+        connection.execute("DELETE FROM entity_identifiers WHERE source_document_id=?", (upload_id,))
+        connection.execute(
+            """UPDATE document_entity_links SET entity_id=NULL, status='needs_review', confidence=NULL,
+            reason='Removed from its customer by a reviewer.', resolved_at=? WHERE document_id=?""",
+            (utc_now(), upload_id),
+        )
+        connection.commit()
+    return document_payload(get_upload(upload_id))
+
+
 @app.post("/uploads", status_code=201)
 def upload_file(file: UploadFile = File(...), spaceId: str | None = Form(None)) -> dict[str, str | int | None]:
     """Upload a document as customer knowledge, or file it straight into a shared space."""
@@ -892,6 +944,18 @@ def list_conversations(limit: int = 50, offset: int = 0, agentId: str | None = N
         return [chat_history.conversation_payload(row) for row in rows]
 
 
+@app.delete("/conversations")
+def delete_conversations(agentId: str) -> dict[str, int]:
+    """Delete every chat of one agent; ``agentId=none`` deletes the pre-agent chats."""
+    with closing(get_connection()) as connection:
+        if agentId == "none":
+            deleted = connection.execute("DELETE FROM conversations WHERE agent_id IS NULL").rowcount
+        else:
+            deleted = connection.execute("DELETE FROM conversations WHERE agent_id=?", (agentId,)).rowcount
+        connection.commit()
+    return {"deletedChats": deleted}
+
+
 @app.get("/conversations/{conversation_id}")
 def get_conversation(conversation_id: str) -> dict[str, object]:
     with closing(get_connection()) as connection:
@@ -1181,16 +1245,22 @@ def update_knowledge_space(space_id: str, payload: dict[str, object]) -> dict[st
 
 
 @app.delete("/knowledge/spaces/{space_id}", status_code=204, response_class=Response)
-def delete_knowledge_space(space_id: str) -> Response:
+def delete_knowledge_space(space_id: str, moveDocuments: bool = False) -> Response:
+    """Delete a shared space. With ``moveDocuments`` its documents return to
+    customer knowledge (and customer detection runs again); otherwise a space
+    that still holds documents is not deleted."""
     with closing(get_connection()) as connection:
         space = knowledge.get_space(connection, space_id)
         if space is None:
             raise HTTPException(status_code=404, detail="Knowledge space not found.")
-        if space["document_count"]:
+        if space["document_count"] and not moveDocuments:
             raise HTTPException(status_code=409, detail=f"Move or delete the {space['document_count']} document(s) in {space['name']} first.")
+        for document_id in knowledge.space_document_ids(connection, [space_id]):
+            knowledge.move_to_entity_knowledge(connection, document_id)
         agents.remove_space_from_agents(connection, space_id)
         connection.execute("DELETE FROM knowledge_spaces WHERE id=?", (space_id,))
         connection.commit()
+    enqueue_processing()
     return Response(status_code=204)
 
 
@@ -1271,8 +1341,6 @@ def delete_agent(agent_id: str) -> Response:
         agent = agents.get_agent(connection, agent_id)
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found.")
-        if agent["is_builtin"]:
-            raise HTTPException(status_code=409, detail="Built-in agents can be edited but not deleted.")
         # The agent's chats cannot be answered without it; remove them with it.
         connection.execute("DELETE FROM conversations WHERE agent_id=?", (agent_id,))
         connection.execute("DELETE FROM agents WHERE id=?", (agent_id,))

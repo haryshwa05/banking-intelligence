@@ -2,7 +2,7 @@ import { IconComponent } from './icon.component';
 import { CommonModule } from '@angular/common';
 import { HttpClient, HttpClientModule } from '@angular/common/http';
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, OnInit, Output, SimpleChanges } from '@angular/core';
-import { API_URL, Agent, AgentCatalog, KnowledgeInUse, KnowledgeSpace } from './models';
+import { API_URL, Agent, AgentCatalog, KIND_ICONS, KnowledgeInUse, KnowledgeKind, KnowledgeSpace, initials, toneFor } from './models';
 
 export type ScopeMode = 'all' | 'customer' | 'documents' | 'agent';
 
@@ -50,51 +50,97 @@ interface ScopeDocument {
   imports: [IconComponent, CommonModule, HttpClientModule],
   template: `
     <section class="chat-page">
-      <header *ngIf="!agent" class="chat-header">
-        <div><h1>{{ displayTitle || conversation?.title || 'New chat' }}</h1><span>{{ conversation ? scopeLabel(conversation) : 'Choose a scope, then ask your documents' }}</span></div>
-        <span class="chat-header-label">Document Intelligence</span>
+      <header class="chat-header" [class.agent-header]="!!agent">
+        <div class="agent-header-main">
+          <span *ngIf="agent" [class]="'agent-avatar ' + tone(agent.id)"><app-icon name="agent"></app-icon></span>
+          <span *ngIf="!agent" class="agent-avatar tone-legacy"><app-icon name="chat"></app-icon></span>
+          <div class="agent-header-text">
+            <h1>{{ agent ? agent.name : (displayTitle || conversation?.title || 'New chat') }}</h1>
+            <span>{{ agent ? (conversation ? (displayTitle || conversation.title) : agent.purpose) : (conversation ? scopeLabel(conversation) : 'Choose a scope, then ask your documents') }}</span>
+          </div>
+        </div>
+        <div *ngIf="conversation" class="chat-header-actions">
+          <button type="button" class="icon-button" title="Rename chat" aria-label="Rename chat" (click)="renameChat()"><app-icon name="edit"></app-icon></button>
+          <button type="button" class="icon-button danger" title="Delete chat" aria-label="Delete chat" (click)="deleteChat()"><app-icon name="trash"></app-icon></button>
+        </div>
       </header>
 
-      <ng-container *ngIf="agent">
-        <header class="chat-header agent-header">
-          <div class="agent-header-main"><span class="agent-avatar"><app-icon name="agent"></app-icon></span><div><h1>{{ agent.name }}</h1><span>{{ conversation ? (displayTitle || conversation.title) : 'New chat' }} · {{ agent.purpose }}</span></div></div>
-        </header>
-        <section class="context-bar" aria-label="Chat context">
-          <div class="context-item">
-            <small>Customer</small>
-            <ng-container *ngIf="conversation"><strong>{{ conversationCustomerName() }}</strong><em>Fixed for this chat</em></ng-container>
-            <ng-container *ngIf="!conversation && agent.customerAccess !== 'none'">
-              <select aria-label="Select customer" [value]="selectedEntityId" (change)="selectCustomer($any($event.target).value)">
-                <option value="">{{ agent.customerAccess === 'required' ? 'Choose customer…' : 'No customer (shared knowledge only)' }}</option>
-                <option *ngFor="let customer of customers" [value]="customer.id">{{ customer.name }} ({{ customer.documentCount }} docs)</option>
-              </select>
-              <em>{{ agent.customerAccess === 'required' ? 'Required · locked once the chat starts' : 'Optional · locked once the chat starts' }}</em>
-            </ng-container>
-            <ng-container *ngIf="!conversation && agent.customerAccess === 'none'"><strong>Not used</strong><em>This agent uses shared knowledge only</em></ng-container>
-          </div>
-          <div class="context-item grow">
-            <small>Knowledge in use</small>
-            <div class="knowledge-chips">
-              <span *ngFor="let source of knowledgeSources()" [class]="'knowledge-chip kind-' + source.kind" [title]="kindLabel(source.kind)">{{ source.name }} · {{ source.documentCount }} doc{{ source.documentCount === 1 ? '' : 's' }}</span>
-              <span *ngIf="agent.customerAccess === 'required' && !conversation && !selectedEntityId" class="knowledge-chip kind-entity pending">Customer documents · choose a customer</span>
-              <span *ngIf="!knowledgeSources().length && !(agent.customerAccess === 'required' && !selectedEntityId)" class="knowledge-empty">No knowledge available</span>
+      <!-- Once a chat has started, its context is fixed and shown as one aligned strip. -->
+      <section *ngIf="agent && conversation" class="context-strip" aria-label="Chat context">
+        <span class="context-pill pill-customer" [title]="'Customer for this chat (fixed)'">
+          <span class="pill-icon"><app-icon name="user"></app-icon></span>
+          <span class="pill-text"><small>Customer</small><strong>{{ conversationCustomerName() }}</strong></span>
+          <app-icon class="pill-trailing" name="lock"></app-icon>
+        </span>
+        <details class="context-pill pill-knowledge">
+          <summary>
+            <span class="pill-icon"><app-icon name="layers"></app-icon></span>
+            <span class="pill-text"><small>Knowledge in use</small><strong>{{ knowledgeSources().length }} source{{ knowledgeSources().length === 1 ? '' : 's' }} · {{ knowledge?.documentCount || 0 }} docs</strong></span>
+            <app-icon class="pill-trailing" name="down"></app-icon>
+          </summary>
+          <div class="context-popover">
+            <div *ngFor="let source of knowledgeSources()" [class]="'source-row kind-' + source.kind">
+              <span class="source-icon"><app-icon [name]="kindIcon(source.kind)"></app-icon></span>
+              <span class="source-text"><strong>{{ source.name }}</strong><small>{{ kindLabel(source.kind) }}</small></span>
+              <span class="source-count">{{ source.documentCount }} doc{{ source.documentCount === 1 ? '' : 's' }}</span>
             </div>
-            <em *ngIf="knowledgeError" class="context-error">{{ knowledgeError }}</em>
+            <p *ngIf="knowledgeError" class="context-error">{{ knowledgeError }}</p>
           </div>
-          <details class="context-item capabilities">
-            <summary><small>Capabilities</small><strong>{{ agent.capabilities.length }} enabled</strong></summary>
-            <ul><li *ngFor="let id of agent.capabilities" [title]="capabilityDescription(id)">{{ capabilityLabel(id) }}</li></ul>
-          </details>
-        </section>
-      </ng-container>
+        </details>
+        <details class="context-pill pill-capabilities">
+          <summary>
+            <span class="pill-icon"><app-icon name="sparkle"></app-icon></span>
+            <span class="pill-text"><small>Capabilities</small><strong>{{ agent.capabilities.length }} enabled</strong></span>
+            <app-icon class="pill-trailing" name="down"></app-icon>
+          </summary>
+          <div class="context-popover">
+            <div *ngFor="let id of agent.capabilities" class="capability-row"><app-icon name="check"></app-icon><span><strong>{{ capabilityLabel(id) }}</strong><small>{{ capabilityDescription(id) }}</small></span></div>
+          </div>
+        </details>
+        <span class="context-guard"><app-icon name="shield"></app-icon>Other customers' documents are never searched</span>
+      </section>
 
       <div class="chat-scroll" #chatScroll>
         <div class="chat-thread">
           <div *ngIf="isLoading" class="chat-empty">Loading conversation...</div>
           <div *ngIf="!isLoading && !messages.length && !agent" class="chat-empty">Ask a question to start a chat.</div>
-          <div *ngIf="!isLoading && !messages.length && agent" class="chat-empty agent-intro">
-            <div><span class="agent-avatar large"><app-icon name="agent"></app-icon></span><h2>{{ agent.name }}</h2><p>{{ agent.description || agent.purpose }}</p>
-              <p class="agent-intro-note">Answers use only the knowledge shown above, with page citations. Other customers' documents are never searched.</p></div>
+
+          <!-- New agent chat: a guided setup instead of a dense header. -->
+          <div *ngIf="!isLoading && !messages.length && agent && !conversation" class="chat-setup">
+            <div class="setup-hero">
+              <span [class]="'agent-avatar large ' + tone(agent.id)"><app-icon name="agent"></app-icon></span>
+              <h2>{{ agent.name }}</h2>
+              <p>{{ agent.description || agent.purpose }}</p>
+            </div>
+
+            <section *ngIf="agent.customerAccess !== 'none'" class="setup-step step-customer">
+              <div class="step-head"><span class="step-number">1</span><div><h3>Who are you working on?</h3><p>{{ agent.customerAccess === 'required' ? 'Choose one customer. It stays fixed for this chat, so their context never mixes with another customer.' : 'Optional. Pick a customer, or ask about shared knowledge only.' }}</p></div></div>
+              <label class="setup-search"><app-icon name="search"></app-icon><input aria-label="Find customer" placeholder="Find a customer" [value]="customerFilter" (input)="customerFilter = $any($event.target).value"></label>
+              <div class="customer-grid">
+                <button *ngIf="agent.customerAccess === 'optional'" type="button" class="customer-option shared-only" [class.selected]="!selectedEntityId" (click)="selectCustomer('')">
+                  <span class="customer-avatar"><app-icon name="book"></app-icon></span><span class="customer-text"><strong>No customer</strong><small>Shared knowledge only</small></span><app-icon *ngIf="!selectedEntityId" class="customer-check" name="check"></app-icon>
+                </button>
+                <button *ngFor="let customer of filteredCustomers()" type="button" class="customer-option" [class.selected]="selectedEntityId === customer.id" (click)="selectCustomer(customer.id)">
+                  <span [class]="'customer-avatar ' + tone(customer.id)">{{ initialsOf(customer.name) }}</span><span class="customer-text"><strong>{{ customer.name }}</strong><small>{{ customer.documentCount }} document{{ customer.documentCount === 1 ? '' : 's' }}</small></span><app-icon *ngIf="selectedEntityId === customer.id" class="customer-check" name="check"></app-icon>
+                </button>
+                <p *ngIf="!filteredCustomers().length" class="setup-empty">No customers match. Customers appear after their documents are uploaded.</p>
+              </div>
+            </section>
+
+            <section class="setup-step">
+              <div class="step-head"><span class="step-number">{{ agent.customerAccess === 'none' ? 1 : 2 }}</span><div><h3>Knowledge this chat will use</h3><p>The agent can read only these sources.</p></div></div>
+              <div class="source-tiles">
+                <div *ngIf="agent.customerAccess === 'required' && !selectedEntityId" class="source-tile kind-entity pending"><span class="source-icon"><app-icon name="user"></app-icon></span><strong>Customer documents</strong><small>Choose a customer above</small></div>
+                <div *ngFor="let source of knowledgeSources()" [class]="'source-tile kind-' + source.kind"><span class="source-icon"><app-icon [name]="kindIcon(source.kind)"></app-icon></span><strong>{{ source.name }}</strong><small>{{ kindLabel(source.kind) }} · {{ source.documentCount }} doc{{ source.documentCount === 1 ? '' : 's' }}</small></div>
+              </div>
+              <p *ngIf="knowledgeError" class="context-error">{{ knowledgeError }}</p>
+            </section>
+
+            <section class="setup-step">
+              <div class="step-head"><span class="step-number">{{ agent.customerAccess === 'none' ? 2 : 3 }}</span><div><h3>What it can do</h3></div></div>
+              <div class="capability-pills"><span *ngFor="let id of agent.capabilities" class="capability-pill" [title]="capabilityDescription(id)"><app-icon name="check"></app-icon>{{ capabilityLabel(id) }}</span></div>
+            </section>
+            <p class="setup-note"><app-icon name="shield"></app-icon>Answers cite the exact page they came from. Other customers' documents are never searched.</p>
           </div>
           <ng-container *ngFor="let message of messages">
             <div *ngIf="message.role === 'user'" class="chat-message user-message">
@@ -104,7 +150,7 @@ interface ScopeDocument {
               <div class="message-body">
                 <small *ngIf="message.status === 'streaming'" class="draft-label">Draft · validating sources</small><p class="assistant-copy" [class.provisional]="message.status === 'streaming'">{{ message.content }}<span *ngIf="message.status === 'streaming'" class="stream-cursor"></span></p>
                 <div *ngIf="message.sources.length" class="chat-sources"><button type="button" *ngFor="let source of message.sources" [disabled]="documentsLoaded && !hasDocument(source.documentId)" (click)="sourceOpened.emit(source.documentId)">{{ source.filename }} · p. {{ source.pageNumber }}<span *ngIf="documentsLoaded && !hasDocument(source.documentId)"> · deleted</span></button></div>
-                <small *ngIf="message.context" class="answer-context">Knowledge used: {{ contextLabel(message.context) }}</small>
+                <div *ngIf="message.context" class="answer-context"><span>Knowledge used</span><span *ngFor="let source of message.context.sources" [class]="'knowledge-chip kind-' + source.kind">{{ source.name }}</span></div>
                 <div *ngIf="message.debug" class="chat-trace"><button type="button" (click)="expandedTraceId = expandedTraceId === message.id ? null : message.id">{{ expandedTraceId === message.id ? 'Hide' : 'Show' }} developer trace</button><span>{{ message.mode }} route</span></div>
                 <section *ngIf="message.debug && expandedTraceId === message.id" class="developer-trace" aria-label="Developer trace"><div class="trace-header"><strong>Developer trace</strong><small>Local retrieval and final evidence path</small></div><div class="trace-overview"><div><small>Route</small><strong>{{ traceValue(message, 'route') }}</strong></div><div><small>Scope</small><strong>{{ traceValue(message, 'documentScope') }}</strong></div><div><small>Final evidence</small><strong>{{ traceValue(message, 'finalEvidenceIds') || traceValue(message, 'claudeValidatedCitationIds') || 'None' }}</strong></div></div><details open><summary>Structured facts</summary><pre>{{ traceValue(message, 'structuredFacts') | json }}</pre></details><details><summary>RAG retrieval</summary><pre>{{ traceValue(message, 'rag') | json }}</pre></details><details><summary>Complete trace</summary><pre>{{ message.debug | json }}</pre></details><p>Contains excerpts and financial data. Use only in a trusted environment.</p></section>
               </div>
@@ -127,7 +173,7 @@ interface ScopeDocument {
           <span *ngIf="!agent && conversation" class="composer-scope-fixed" [title]="scopeLabel(conversation)">{{ compactScopeLabel(conversation) }}</span>
           <button class="composer-send" type="button" [attr.aria-label]="isStreaming ? 'Stop answer' : 'Send message'" [title]="isStreaming ? 'Stop' : 'Send'" [disabled]="!canSend() && !isStreaming" (click)="isStreaming ? stop() : send()"><svg *ngIf="!isStreaming" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 19V5m0 0-5 5m5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg *ngIf="isStreaming" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/></svg></button>
         </div>
-        <small class="composer-hint">{{ agent && agent.customerAccess === 'required' && !conversation && !selectedEntityId ? 'Choose a customer above to start.' : 'Answers are grounded in retrieved document evidence. Enter to send · Shift+Enter for a new line.' }}</small>
+        <small class="composer-hint" [class.attention]="needsCustomer()">{{ needsCustomer() ? 'Choose a customer above to start chatting.' : 'Answers are grounded in retrieved document evidence. Enter to send · Shift+Enter for a new line.' }}</small>
       </div>
     </section>
   `
@@ -141,6 +187,7 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
   @Output() conversationChanged = new EventEmitter<Conversation>();
   @Output() sourceOpened = new EventEmitter<string>();
   @Output() repositoryOpened = new EventEmitter<void>();
+  @Output() conversationDeleted = new EventEmitter<Conversation>();
 
   private readonly apiUrl = API_URL;
   private abortController: AbortController | null = null;
@@ -239,6 +286,28 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
     return this.knowledge?.entity?.name || this.customers.find(item => item.id === this.conversation?.entityId)?.name || 'Customer';
   }
   contextLabel(context: KnowledgeInUse): string { return context.sources.map(source => source.name).join(' · ') || 'none'; }
+  tone(id: string): string { return toneFor(id); }
+  initialsOf(name: string): string { return initials(name); }
+  kindIcon(kind: string): string { return KIND_ICONS[kind as KnowledgeKind] || 'file'; }
+  needsCustomer(): boolean { return !!this.agent && this.agent.customerAccess === 'required' && !this.conversation && !this.selectedEntityId; }
+  renameChat(): void {
+    const conversation = this.conversation;
+    const title = conversation ? window.prompt('Chat title', this.displayTitle || conversation.title)?.trim() : null;
+    if (!conversation || !title || title === conversation.title) return;
+    this.http.patch<Conversation>(`${this.apiUrl}/conversations/${conversation.id}`, { title }).subscribe({
+      next: updated => { this.conversation = updated; this.conversationChanged.emit(updated); },
+      error: () => this.error = 'Could not rename this chat.'
+    });
+  }
+  deleteChat(): void {
+    const conversation = this.conversation;
+    if (!conversation || !window.confirm(`Delete chat "${this.displayTitle || conversation.title}"? This cannot be undone.`)) return;
+    this.stop();
+    this.http.delete(`${this.apiUrl}/conversations/${conversation.id}`).subscribe({
+      next: () => this.conversationDeleted.emit(conversation),
+      error: () => this.error = 'Could not delete this chat.'
+    });
+  }
   kindLabel(kind: string): string { return kind === 'entity' ? 'Entity knowledge (customer-specific)' : kind === 'reference' ? 'Reference knowledge (shared)' : 'Operational knowledge (shared)'; }
   capabilityLabel(id: string): string { return this.catalog?.capabilities.find(item => item.id === id)?.label || id; }
   capabilityDescription(id: string): string { return this.catalog?.capabilities.find(item => item.id === id)?.description || ''; }
