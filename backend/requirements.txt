@@ -9,3 +9,6 @@ chromadb
 sentence-transformers
 anthropic
 python-dotenv
+pandas
+openpyxl
+python-docx

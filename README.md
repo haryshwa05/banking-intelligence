@@ -58,15 +58,23 @@ Choose a shared space in the upload bar's **File into** selector, or move an exi
 
 ## Agents
 
-Chats are held with specialised agents. Each agent has a name, purpose, description, instructions, model, knowledge access and capabilities, all editable in **Agent Builder**. Three agents are built in: Customer Document Analyst (customer documents only), Loan Eligibility Analyst (customer + Lending Policies) and Compliance Analyst (Compliance & Regulatory, plus a customer if one is chosen).
+Chats are held with specialised agents. Each agent has a name, purpose, description, instructions, model, knowledge access and capabilities, all editable in **Agent Builder**. Four agents are built in: Customer Document Analyst (customer documents only), Loan Eligibility Analyst (customer + Lending Policies), Compliance Analyst (Compliance & Regulatory, plus a customer if one is chosen) and Portfolio Data Analyst (spreadsheets in the Portfolio Data space).
 
 - **Reusable, customer-bound chats**: an agent never stores a customer. Each chat binds the agent to one customer, chosen when the chat starts and fixed from then on. The same agent therefore works for Tony Stark in one chat and Bruce Wayne in another, with separate histories.
 - **Governed retrieval**: for every turn the API resolves the agent's effective knowledge (the chat customer's own documents plus the agent's granted spaces) and passes only those document IDs to fact lookup and retrieval. A question naming a different customer is refused, and an empty scope is never widened to the full library. Changing an agent's access applies to its existing chats from their next question.
-- **Capabilities are enforced**, not just described: passage search, fact lookup, verified calculations, policy-rule evaluation, customer overview and a deterministic cross-document consistency check each gate an engine route.
+- **Capabilities are enforced**, not just described: passage search, fact lookup, verified calculations, policy-rule evaluation, customer overview, a deterministic cross-document consistency check and spreadsheet analysis each gate an engine route.
 - **Visible context**: every agent chat shows the agent, the customer and the knowledge in use, with document counts. Each answer records the knowledge it was produced from.
 - **Models**: only Claude Haiku 4.5 is approved for API calls. The builder offers only Haiku, and the API rejects any other model.
 
 Chats created before agents existed are still available under **Earlier chats**.
+
+## Spreadsheets, Word and text files
+
+CSV, TSV and Excel (`.xlsx`, `.xlsm`) files, Word (`.docx`) files and text (`.txt`, `.md`) files are read as well as PDFs and images.
+
+- **Word and text files** are split into labelled sections ("Section 2") and go through the same facts, retrieval and citation pipeline as PDFs.
+- **Spreadsheets are analysed exactly, not summarised.** Every sheet is profiled at ingestion: columns, types, ranges and the values of low-cardinality columns. Title rows above the real header are skipped, every Excel sheet is read, identifiers such as account numbers keep their leading zeros, and Excel's UTF-16 "Unicode Text" exports are decoded. For a question, Claude (Haiku) only *plans* a query from the profile, using a fixed vocabulary of filters, groupings and count/sum/average/min/max/median. It never writes code or sees the rows. pandas validates the plan against the real columns and executes it over every row. The answer states the filters and how many rows they matched, cites the sheet, and shows the result table. Plans that reference unknown columns or sum a text column are rejected and the question falls back to passage search.
+- Spreadsheets skip page-level fact extraction. Agents use them through the **Analyse spreadsheets** capability; the built-in Portfolio Data Analyst answers from files filed in the **Portfolio Data** space.
 
 ## Developer trace
 
@@ -76,7 +84,7 @@ Completed answers have a collapsed **Show developer trace** control. It is inten
 
 ```powershell
 cd backend
-.\.venv\Scripts\python.exe -m unittest test_facts.py test_entity_resolution.py test_scope_api.py test_chat_api.py test_rag_stream.py test_agents_api.py
+.\.venv\Scripts\python.exe -m unittest test_facts.py test_entity_resolution.py test_scope_api.py test_chat_api.py test_rag_stream.py test_agents_api.py test_tables.py
 
 cd ..\frontend
 npm run build
@@ -86,6 +94,8 @@ npm run build
 
 - PDFs and images are extracted in English.
 - Files must be 50 MB or smaller; PDFs may contain up to 100 pages.
-- Office documents are stored and listed, but text extraction for them is not included yet.
+- Legacy Office formats (`.doc`, `.xls`) and PowerPoint files are stored and listed but not read. Save them as `.docx`, `.xlsx` or `.csv` to analyse them.
+- In-app preview is available for PDFs and images; other files open in a new tab.
+- Spreadsheet questions query one sheet at a time, and a result shows at most 50 rows or groups (the full count is always reported).
 - The first embedding or reranking run downloads the local models to `backend/rag_models/`; later indexing and reranking are local. Normal runtime is cache-only; set `ALLOW_MODEL_DOWNLOADS=1` temporarily in `backend/.env` only when bootstrapping models on a new machine.
 - Claude access is optional but required to turn retrieved passages into natural-language answers. Its model is configured with `CLAUDE_MODEL` in `backend/.env`.

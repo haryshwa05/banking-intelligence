@@ -50,6 +50,9 @@ def initialise(connection: sqlite3.Connection) -> None:
     # chat keeps an honest record even if the agent's access changes later.
     if "context_json" not in message_columns:
         connection.execute("ALTER TABLE chat_messages ADD COLUMN context_json TEXT")
+    # Structured results shown with an answer, such as a spreadsheet result table.
+    if "table_json" not in message_columns:
+        connection.execute("ALTER TABLE chat_messages ADD COLUMN table_json TEXT")
     # Agent chats bind one reusable agent to (optionally) one customer.
     if "agent_id" not in {row[1] for row in connection.execute("PRAGMA table_info(conversations)")}:
         connection.execute("ALTER TABLE conversations ADD COLUMN agent_id TEXT")
@@ -77,6 +80,7 @@ def message_payload(row: sqlite3.Row) -> dict[str, Any]:
         "sources": json.loads(row["sources_json"] or "[]"), "mode": row["mode"],
         "debug": json.loads(row["debug_json"]) if row["debug_json"] else None,
         "context": json.loads(row["context_json"]) if "context_json" in row.keys() and row["context_json"] else None,
+        "table": json.loads(row["table_json"]) if "table_json" in row.keys() and row["table_json"] else None,
         "createdAt": row["created_at"],
     }
 

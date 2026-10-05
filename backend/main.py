@@ -25,6 +25,8 @@ from rag import RagEngine
 import agents
 import chat_history
 import knowledge
+import office
+import tables
 
 UPLOADS_DIR = APP_DIR / "uploads"
 DATABASE_PATH = APP_DIR / "upload_metadata.db"
@@ -62,8 +64,28 @@ def get_connection() -> sqlite3.Connection:
     return connection
 
 
-def is_extractable(mime_type: str) -> bool:
+def document_kind(upload: sqlite3.Row) -> str | None:
+    return office.document_kind(upload["original_name"], upload["mime_type"])
+
+
+def is_extractable(upload: sqlite3.Row) -> bool:
+    return document_kind(upload) is not None
+
+
+def is_previewable(mime_type: str) -> bool:
     return mime_type == "application/pdf" or mime_type.startswith("image/")
+
+
+def page_labels(connection: sqlite3.Connection, document_ids: list[str]) -> dict[str, list[str]]:
+    """Human-readable page names ("Section 2", "Sheet Loans · Rows 1–50") per document."""
+    if not document_ids:
+        return {}
+    placeholders = ",".join("?" for _ in document_ids)
+    rows = connection.execute(
+        f"SELECT upload_id, page_labels FROM extractions WHERE upload_id IN ({placeholders}) AND page_labels IS NOT NULL",
+        document_ids,
+    ).fetchall()
+    return {row["upload_id"]: json.loads(row["page_labels"]) for row in rows}
 
 
 def citation_sources(rows: list[sqlite3.Row], document_id_key: str) -> list[dict[str, object]]:
@@ -85,6 +107,13 @@ def citation_sources(rows: list[sqlite3.Row], document_id_key: str) -> list[dict
                 "chunkId": row["id"],
             }
         )
+    if sources:
+        with closing(get_connection()) as connection:
+            labels = page_labels(connection, list({source["documentId"] for source in sources}))
+        for source in sources:
+            document_labels = labels.get(str(source["documentId"]), [])
+            if 0 < int(source["pageNumber"]) <= len(document_labels):
+                source["pageLabel"] = document_labels[int(source["pageNumber"]) - 1]
     return sources
 
 
@@ -106,26 +135,40 @@ def initialise_storage() -> None:
         chat_history.initialise(connection)
         knowledge.initialise(connection)
         agents.initialise(connection)
+        tables.initialise(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS extractions (
                 upload_id TEXT PRIMARY KEY, status TEXT NOT NULL, extracted_text TEXT,
                 page_count INTEGER, ocr_page_count INTEGER, error_message TEXT,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT,
+                page_labels TEXT,
                 FOREIGN KEY (upload_id) REFERENCES uploads(id)
             )
             """
         )
+        if "page_labels" not in {row[1] for row in connection.execute("PRAGMA table_info(extractions)")}:
+            connection.execute("ALTER TABLE extractions ADD COLUMN page_labels TEXT")
         now = utc_now()
+        uploads = connection.execute(
+            "SELECT uploads.*, extractions.status AS extraction_status FROM uploads LEFT JOIN extractions ON extractions.upload_id=uploads.id"
+        ).fetchall()
+        for upload in uploads:
+            supported = is_extractable(upload)
+            if upload["extraction_status"] is None:
+                connection.execute(
+                    "INSERT INTO extractions (upload_id, status, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (upload["id"], "queued" if supported else "unsupported", now, now),
+                )
+            elif upload["extraction_status"] == "unsupported" and supported:
+                # Files stored before their format was supported are read now.
+                connection.execute("UPDATE extractions SET status='queued', updated_at=? WHERE upload_id=?", (now, upload["id"]))
+        # Spreadsheets are analysed from their rows, not from extracted facts.
         connection.execute(
             """
-            INSERT OR IGNORE INTO extractions (upload_id, status, created_at, updated_at)
-            SELECT id,
-                   CASE WHEN mime_type = 'application/pdf' OR mime_type LIKE 'image/%' THEN 'queued' ELSE 'unsupported' END,
-                   ?, ?
-            FROM uploads
-            """,
-            (now, now),
+            INSERT OR IGNORE INTO document_facts (upload_id, status, extraction_version)
+            SELECT upload_id, 'not_applicable', 'generic-facts-v1' FROM document_tables GROUP BY upload_id
+            """
         )
         connection.execute(
             """
@@ -176,6 +219,7 @@ def recover_interrupted_jobs() -> None:
 def document_payload(row: sqlite3.Row) -> dict[str, str | int | None]:
     return {
         "id": row["id"], "name": row["original_name"], "type": row["mime_type"],
+        "documentKind": document_kind(row),
         "sizeBytes": row["size_bytes"], "uploadedAt": row["uploaded_at"],
         "url": f"/uploads/{row['id']}/file", "extractionStatus": row["extraction_status"],
         "indexStatus": row["index_status"] if "index_status" in row.keys() else None,
@@ -236,14 +280,17 @@ def claim_next_job() -> sqlite3.Row | None:
         return row if cursor.rowcount else None
 
 
-def complete_job(upload_id: str, text: str, page_count: int, ocr_page_count: int) -> None:
+def complete_job(
+    upload_id: str, text: str, page_count: int, ocr_page_count: int,
+    labels: list[str] | None = None, table_profiles: list[dict[str, object]] | None = None,
+) -> None:
     now = utc_now()
     with closing(get_connection()) as connection:
         connection.execute(
             """
             UPDATE extractions SET status = 'completed', extracted_text = ?, page_count = ?, ocr_page_count = ?,
-            error_message = NULL, updated_at = ?, completed_at = ? WHERE upload_id = ?
-            """, (text, page_count, ocr_page_count, now, now, upload_id),
+            page_labels = ?, error_message = NULL, updated_at = ?, completed_at = ? WHERE upload_id = ?
+            """, (text, page_count, ocr_page_count, json.dumps(labels) if labels else None, now, now, upload_id),
         )
         connection.execute(
             """
@@ -254,7 +301,17 @@ def complete_job(upload_id: str, text: str, page_count: int, ocr_page_count: int
             """,
             (upload_id,),
         )
-        facts.queue_document(connection, upload_id)
+        if table_profiles is not None:
+            # A spreadsheet's rows are queried exactly; per-page fact
+            # extraction would send every row block to Claude for nothing.
+            tables.store_profiles(connection, upload_id, table_profiles)
+            connection.execute(
+                """INSERT INTO document_facts (upload_id, status, extraction_version) VALUES (?, 'not_applicable', ?)
+                ON CONFLICT(upload_id) DO UPDATE SET status='not_applicable', error_message=NULL""",
+                (upload_id, "generic-facts-v1"),
+            )
+        else:
+            facts.queue_document(connection, upload_id)
         connection.commit()
 
 
@@ -362,21 +419,48 @@ def worker_loop() -> None:
         process_pending_concept_mapping()
         process_pending_entity_resolution()
         while job := claim_next_job():
-            try:
-                path = UPLOADS_DIR / job["stored_name"]
-                if not path.is_file():
-                    raise FileNotFoundError("Stored file is missing.")
-                if job["mime_type"] == "application/pdf":
-                    text, page_count, ocr_page_count = extractor.extract_pdf(path)
-                else:
-                    text, page_count, ocr_page_count = extractor.extract_image(path)
-                complete_job(job["id"], text, page_count, ocr_page_count)
-                process_pending_indexes(job["id"])
-                process_pending_facts(job["id"])
-                process_pending_concept_mapping(job["id"])
-                process_pending_entity_resolution(job["id"])
-            except Exception as error:
-                fail_job(job["id"], error)
+            process_job(job)
+
+
+def extract_job(job: sqlite3.Row) -> None:
+    """Read one claimed upload and record its text, page labels and table profiles."""
+    path = UPLOADS_DIR / job["stored_name"]
+    if not path.is_file():
+        raise FileNotFoundError("Stored file is missing.")
+    kind = document_kind(job)
+    labels: list[str] | None = None
+    table_profiles: list[dict[str, object]] | None = None
+    if kind == office.PDF:
+        text, page_count, ocr_page_count = extractor.extract_pdf(path)
+    elif kind == office.IMAGE:
+        text, page_count, ocr_page_count = extractor.extract_image(path)
+    elif kind == office.SPREADSHEET:
+        sheets = tables.load_sheets(path)
+        if not sheets:
+            raise ValueError("The spreadsheet has no readable rows.")
+        text, labels, table_profiles = tables.sheet_text(job["original_name"], sheets)
+        page_count, ocr_page_count = len(labels), 0
+        tables.remember(job["id"], sheets)
+    elif kind == office.WORD:
+        text, page_count, labels = office.extract_word(path)
+        ocr_page_count = 0
+    elif kind == office.TEXT:
+        text, page_count, labels = office.extract_plain_text(path)
+        ocr_page_count = 0
+    else:
+        raise ValueError("This file type cannot be read.")
+    complete_job(job["id"], text, page_count, ocr_page_count, labels, table_profiles)
+
+
+def process_job(job: sqlite3.Row) -> None:
+    try:
+        extract_job(job)
+        process_pending_indexes(job["id"])
+        process_pending_facts(job["id"])
+        process_pending_concept_mapping(job["id"])
+        process_pending_entity_resolution(job["id"])
+    except Exception as error:
+        fail_job(job["id"], error)
 
 
 def start_worker() -> None:
@@ -527,7 +611,7 @@ def upload_file(file: UploadFile = File(...), spaceId: str | None = Form(None)) 
         file.file.close()
 
     uploaded_at = utc_now()
-    extraction_status = "queued" if is_extractable(mime_type) else "unsupported"
+    extraction_status = "queued" if office.document_kind(original_name, mime_type) else "unsupported"
     with closing(get_connection()) as connection:
         connection.execute(
             "INSERT INTO uploads (id, original_name, stored_name, mime_type, size_bytes, uploaded_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -550,13 +634,23 @@ def get_extraction(upload_id: str) -> dict[str, object | None]:
     upload = get_upload(upload_id)
     with closing(get_connection()) as connection:
         extraction = connection.execute("SELECT * FROM extractions WHERE upload_id = ?", (upload_id,)).fetchone()
+        table_rows = connection.execute(
+            "SELECT sheet, row_count, columns_json FROM document_tables WHERE upload_id=? ORDER BY position", (upload_id,)
+        ).fetchall()
     if extraction is None:
         raise HTTPException(status_code=404, detail="Extraction record not found.")
+    table_summaries = [
+        {"sheet": row["sheet"], "rowCount": row["row_count"],
+         "columns": [{"name": column["name"], "type": column["type"]} for column in json.loads(row["columns_json"])]}
+        for row in table_rows
+    ] or None
     return {
         "document": document_payload(upload), "status": extraction["status"],
         "text": extraction["extracted_text"] if extraction["status"] == "completed" else None,
         "pageCount": extraction["page_count"], "ocrPageCount": extraction["ocr_page_count"],
         "error": extraction["error_message"], "completedAt": extraction["completed_at"],
+        "pageLabels": json.loads(extraction["page_labels"]) if extraction["page_labels"] else None,
+        "tables": table_summaries,
     }
 
 
@@ -585,8 +679,8 @@ def assign_upload_entity(upload_id: str, payload: dict[str, object]) -> dict[str
 @app.post("/uploads/{upload_id}/extraction/retry")
 def retry_extraction(upload_id: str) -> dict[str, str]:
     upload = get_upload(upload_id)
-    if not is_extractable(upload["mime_type"]):
-        raise HTTPException(status_code=400, detail="Text extraction is only available for PDFs and images.")
+    if not is_extractable(upload):
+        raise HTTPException(status_code=400, detail="Text extraction is available for PDFs, images, spreadsheets, Word and text files.")
     with closing(get_connection()) as connection:
         row = connection.execute("SELECT status FROM extractions WHERE upload_id = ?", (upload_id,)).fetchone()
         if row is None:
@@ -607,8 +701,10 @@ def retry_extraction(upload_id: str) -> dict[str, str]:
 @app.post("/uploads/{upload_id}/facts/retry")
 def retry_fact_extraction(upload_id: str) -> dict[str, str]:
     upload = get_upload(upload_id)
-    if not is_extractable(upload["mime_type"]):
-        raise HTTPException(status_code=400, detail="Fact extraction is only available for PDFs and images.")
+    if not is_extractable(upload):
+        raise HTTPException(status_code=400, detail="Fact extraction is not available for this file type.")
+    if document_kind(upload) == office.SPREADSHEET:
+        raise HTTPException(status_code=400, detail="Spreadsheets are analysed directly from their rows, not from extracted facts.")
     with closing(get_connection()) as connection:
         extraction = connection.execute("SELECT status FROM extractions WHERE upload_id = ?", (upload_id,)).fetchone()
         if extraction is None or extraction["status"] != "completed":
@@ -633,6 +729,7 @@ def delete_upload(upload_id: str) -> Response:
         facts.delete_document(connection, upload_id)
         entities.delete_document(connection, upload_id)
         knowledge.delete_document(connection, upload_id)
+        tables.delete_document(connection, upload_id)
         connection.execute("DELETE FROM extractions WHERE upload_id = ?", (upload_id,))
         connection.execute("DELETE FROM uploads WHERE id = ?", (upload_id,))
         connection.commit()
@@ -699,8 +796,9 @@ STRUCTURED_CAPABILITIES = {"fact_lookup", "calculations", "policy_evaluation", "
 
 def _answer_from_scope(
     question: str, document_ids: list[str] | None, trace: dict[str, object], capabilities: set[str] | None = None,
+    model: str = agents.DEFAULT_MODEL,
 ) -> tuple[dict[str, object] | None, list[sqlite3.Row], dict[str, object]]:
-    """Run structured facts, then strict RAG, over an already-authorised scope.
+    """Run spreadsheet analysis, structured facts, then strict RAG, over an already-authorised scope.
 
     ``capabilities`` is an agent's allowed tool set; ``None`` keeps the legacy
     unrestricted behaviour. An empty list scope must never reach retrieval,
@@ -708,6 +806,20 @@ def _answer_from_scope(
     """
     if document_ids is not None and not document_ids:
         raise ValueError("An empty document scope cannot be searched.")
+    if capabilities is None or "table_analysis" in capabilities:
+        try:
+            with closing(get_connection()) as connection:
+                table_result, table_trace = tables.answer(connection, question, document_ids, UPLOADS_DIR, model)
+        except Exception as error:
+            # Spreadsheet analysis is an extra route; its failure must not
+            # block passage search over the same scope.
+            logger.exception("Spreadsheet analysis failed")
+            table_result, table_trace = None, {"reason": f"Spreadsheet analysis failed: {type(error).__name__}."}
+        trace["tables"] = table_trace
+        if table_result is not None:
+            trace["route"] = "table-analysis"
+            trace["finalEvidenceIds"] = [source["chunkId"] for source in table_result["sources"]]
+            return {**table_result, "mode": "table", "debug": trace}, [], trace
     try:
         structured_answer = None
         if capabilities is None or capabilities & STRUCTURED_CAPABILITIES:
@@ -819,7 +931,7 @@ def _prepare_agent_question(
             "answer": agents.describe_conflicts(conflicts, compared, entity["name"]),
             "sources": citation_sources(evidence, "document_id"), "mode": "consistency", "debug": trace,
         }, [], trace
-    return _answer_from_scope(question, document_ids, trace, capabilities)
+    return _answer_from_scope(question, document_ids, trace, capabilities, agent["model"])
 
 
 def _finish_rag(answer: str, cited_chunk_ids: list[str], chunks: list[sqlite3.Row], trace: dict[str, object]) -> dict[str, object]:
@@ -1109,9 +1221,9 @@ def stream_conversation_message(conversation_id: str, payload: dict[str, object]
                 if not _turn_is_pending(connection, conversation_id, turn_id, attempt_id):
                     raise ChatCancelled()
                 connection.execute(
-                    "INSERT OR REPLACE INTO chat_messages(id, conversation_id, turn_id, role, content, status, sources_json, mode, debug_json, context_json, created_at) VALUES (?, ?, ?, 'assistant', ?, 'completed', ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO chat_messages(id, conversation_id, turn_id, role, content, status, sources_json, mode, debug_json, context_json, table_json, created_at) VALUES (?, ?, ?, 'assistant', ?, 'completed', ?, ?, ?, ?, ?, ?)",
                     (chat_history.new_id(), conversation_id, turn_id, result["answer"], json.dumps(result["sources"]), result["mode"], json.dumps(result["debug"]),
-                     json.dumps(knowledge_used) if knowledge_used else None, timestamp),
+                     json.dumps(knowledge_used) if knowledge_used else None, json.dumps(result["table"]) if result.get("table") else None, timestamp),
                 )
                 connection.execute(
                     "UPDATE chat_messages SET status='completed' WHERE conversation_id=? AND turn_id=? AND role='user' AND attempt_id=?",
@@ -1186,7 +1298,7 @@ def get_document_facts(upload_id: str) -> dict[str, object]:
 @app.get("/uploads/{upload_id}/preview")
 def preview_upload(upload_id: str) -> FileResponse:
     upload = get_upload(upload_id)
-    if not is_extractable(upload["mime_type"]):
+    if not is_previewable(upload["mime_type"]):
         raise HTTPException(status_code=415, detail="In-app preview is available for PDFs and images.")
     file_path = UPLOADS_DIR / upload["stored_name"]
     if not file_path.is_file():

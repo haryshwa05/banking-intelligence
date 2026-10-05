@@ -40,6 +40,10 @@ DEFAULT_SPACES = [
     ("loan-operations", OPERATIONAL, "Loan Review Procedures",
      "Loan review SOPs, manual review checklists and escalation guides."),
 ]
+PORTFOLIO_SPACE = (
+    "portfolio-data", OPERATIONAL, "Portfolio Data",
+    "Operational exports and trackers (CSV or Excel), such as KYC case trackers and dormant account lists.",
+)
 
 
 def utc_now() -> str:
@@ -72,6 +76,15 @@ def initialise(connection: sqlite3.Connection) -> None:
                 (space_id, kind, name, description, now, now),
             )
         connection.execute("INSERT INTO app_meta(key, value) VALUES ('knowledge_seeded_v1', ?)", (now,))
+    # Added with spreadsheet analysis; seeded once like the original spaces.
+    if connection.execute("SELECT 1 FROM app_meta WHERE key='knowledge_seeded_v2'").fetchone() is None:
+        now = utc_now()
+        space_id, kind, name, description = PORTFOLIO_SPACE
+        connection.execute(
+            "INSERT OR IGNORE INTO knowledge_spaces(id, kind, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (space_id, kind, name, description, now, now),
+        )
+        connection.execute("INSERT INTO app_meta(key, value) VALUES ('knowledge_seeded_v2', ?)", (now,))
 
 
 def space_payload(row: sqlite3.Row) -> dict[str, Any]:

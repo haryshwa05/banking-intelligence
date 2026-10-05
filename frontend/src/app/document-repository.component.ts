@@ -11,12 +11,13 @@ interface UploadedDocument {
   id: string;
   name: string;
   type: string;
+  documentKind?: 'pdf' | 'image' | 'spreadsheet' | 'word' | 'text' | null;
   sizeBytes: number;
   uploadedAt: string;
   url: string;
   extractionStatus: ExtractionStatus;
   indexStatus?: 'queued' | 'indexing' | 'ready' | 'failed' | null;
-  factStatus?: 'queued' | 'processing' | 'ready' | 'failed' | null;
+  factStatus?: 'queued' | 'processing' | 'ready' | 'failed' | 'not_applicable' | null;
   entityId?: string | null;
   entityName?: string | null;
   entityStatus?: EntityStatus | null;
@@ -39,6 +40,13 @@ interface DocumentExtraction {
   pageCount: number | null;
   ocrPageCount: number | null;
   error: string | null;
+  tables?: SheetSummary[] | null;
+}
+
+interface SheetSummary {
+  sheet: string;
+  rowCount: number;
+  columns: { name: string; type: 'number' | 'date' | 'text' }[];
 }
 
 interface DocumentFact {
@@ -52,7 +60,7 @@ interface DocumentFact {
 }
 
 interface DocumentFacts {
-  status: 'queued' | 'processing' | 'ready' | 'failed' | 'unavailable';
+  status: 'queued' | 'processing' | 'ready' | 'failed' | 'not_applicable' | 'unavailable';
   error: string | null;
   facts: DocumentFact[];
 }
@@ -66,7 +74,7 @@ interface DocumentFacts {
         <div class="workspace-toolbar">
           <div><h1>Document Repository</h1><span class="document-count">{{ documents.length }} total</span></div>
           <label class="upload-button" for="file-input"><app-icon name="upload"></app-icon>Upload files</label>
-          <input id="file-input" type="file" multiple accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt" (change)="selectFiles($event)">
+          <input id="file-input" type="file" multiple accept="image/*,.pdf,.csv,.tsv,.xlsx,.xlsm,.docx,.txt,.md,.doc,.xls,.ppt,.pptx" (change)="selectFiles($event)">
         </div>
 
         <div class="upload-bar" [class.dragging]="isDragging" (dragover)="onDragOver($event)" (dragleave)="isDragging = false" (drop)="onDrop($event)">
@@ -133,18 +141,26 @@ interface DocumentFacts {
           <div class="preview-heading">Original document</div>
           <iframe *ngIf="activeDocument.type === 'application/pdf'" class="pdf-preview" [src]="previewUrl(activeDocument)" [title]="activeDocument.name"></iframe>
           <img *ngIf="activeDocument.type.startsWith('image/')" class="image-preview" [src]="previewUrl(activeDocument)" [alt]="activeDocument.name">
-          <div *ngIf="!canPreview(activeDocument)" class="preview-unavailable">Preview is available for PDFs and images.</div>
+          <div *ngIf="!canPreview(activeDocument)" class="preview-unavailable">In-app preview is available for PDFs and images. Use Open in new tab to download this file.</div>
         </section>
 
         <div *ngIf="isDetailLoading" class="detail-state">Loading...</div>
         <section *ngIf="!isDetailLoading && extraction" class="extraction">
           <div class="extraction-bar"><span>Extracted text</span><span class="status-badge" [class]="'status-' + extraction.status">{{ statusLabel(extraction.status) }}</span></div>
           <div *ngIf="extraction.status === 'queued' || extraction.status === 'processing'" class="detail-state"><span class="spinner"></span>{{ extraction.status === 'queued' ? 'Waiting to process.' : 'Processing document.' }}</div>
-          <div *ngIf="extraction.status === 'unsupported'" class="detail-state">Extraction is currently available for PDFs and images.</div>
+          <div *ngIf="extraction.status === 'unsupported'" class="detail-state">Text extraction is available for PDFs, images, spreadsheets (CSV and Excel .xlsx), Word (.docx) and text files.</div>
           <div *ngIf="extraction.status === 'failed'" class="failure-state"><strong>Processing failed</strong><span>{{ extraction.error || 'Try again after confirming the backend is running.' }}</span><button type="button" (click)="retry()" [disabled]="isRetrying">{{ isRetrying ? 'Retrying...' : 'Retry extraction' }}</button></div>
           <pre *ngIf="extraction.status === 'completed'" class="extracted-text">{{ extraction.text || 'No readable text was found.' }}</pre>
         </section>
-        <section *ngIf="extraction?.status === 'completed'" class="facts-panel">
+        <section *ngIf="extraction?.status === 'completed' && extraction?.tables?.length" class="facts-panel">
+          <div class="extraction-bar"><span>Spreadsheet data</span><span class="status-badge status-completed">Exact analysis</span></div>
+          <p class="detail-state">Questions about this file are computed over every row, not estimated. Facts are not extracted from spreadsheets.</p>
+          <div *ngFor="let sheet of extraction?.tables" class="sheet-summary">
+            <strong>{{ extraction?.tables?.length === 1 ? 'Columns' : 'Sheet ' + sheet.sheet }}<small>{{ sheet.rowCount | number }} rows</small></strong>
+            <div class="sheet-columns"><span *ngFor="let column of sheet.columns" [class]="'column-' + column.type">{{ column.name }}<small>{{ column.type }}</small></span></div>
+          </div>
+        </section>
+        <section *ngIf="extraction?.status === 'completed' && !extraction?.tables?.length" class="facts-panel">
           <div class="extraction-bar"><span>Structured facts</span><span *ngIf="documentFacts" class="status-badge" [class]="'status-' + documentFacts.status">{{ documentFacts.status }}</span></div>
           <div *ngIf="!documentFacts" class="detail-state">Preparing facts...</div>
           <div *ngIf="documentFacts?.status === 'queued' || documentFacts?.status === 'processing'" class="detail-state">Extracting page-level facts...</div>
@@ -382,6 +398,7 @@ export class DocumentRepositoryComponent implements OnInit, OnDestroy {
     if (document.entityStatus === 'needs_review') return 'Needs ownership review';
     if (document.entityStatus === 'failed') return 'Ownership resolution failed';
     if (document.entityStatus === 'queued' || document.entityStatus === 'processing') return 'Resolving customer…';
+    if (document.factStatus === 'not_applicable') return 'Unassigned';
     return document.extractionStatus === 'unsupported' ? 'Not available' : 'Awaiting document facts';
   }
   filteredCustomers(filterText: string, selectedId: string): Customer[] {

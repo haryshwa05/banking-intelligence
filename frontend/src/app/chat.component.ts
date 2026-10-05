@@ -21,7 +21,14 @@ interface Source {
   documentId: string;
   filename: string;
   pageNumber: number;
+  pageLabel?: string;
   chunkId: string;
+}
+
+interface ResultTable {
+  columns: string[];
+  rows: string[][];
+  totalRows: number;
 }
 
 interface Message {
@@ -34,6 +41,7 @@ interface Message {
   mode: string | null;
   debug: Record<string, unknown> | null;
   context?: KnowledgeInUse | null;
+  table?: ResultTable | null;
   createdAt: string;
 }
 
@@ -149,7 +157,8 @@ interface ScopeDocument {
             <div *ngIf="message.role === 'assistant'" class="chat-message assistant-message">
               <div class="message-body">
                 <small *ngIf="message.status === 'streaming'" class="draft-label">Draft · validating sources</small><p class="assistant-copy" [class.provisional]="message.status === 'streaming'">{{ message.content }}<span *ngIf="message.status === 'streaming'" class="stream-cursor"></span></p>
-                <div *ngIf="message.sources.length" class="chat-sources"><button type="button" *ngFor="let source of message.sources" [disabled]="documentsLoaded && !hasDocument(source.documentId)" (click)="sourceOpened.emit(source.documentId)">{{ source.filename }} · p. {{ source.pageNumber }}<span *ngIf="documentsLoaded && !hasDocument(source.documentId)"> · deleted</span></button></div>
+                <div *ngIf="message.table?.rows?.length" class="result-table-wrap"><table class="result-table"><thead><tr><th *ngFor="let column of message.table!.columns">{{ column }}</th></tr></thead><tbody><tr *ngFor="let row of message.table!.rows"><td *ngFor="let value of row; let index = index" [class.numeric]="isNumeric(value)">{{ value || '—' }}</td></tr></tbody></table><small *ngIf="message.table!.totalRows > message.table!.rows.length">Showing {{ message.table!.rows.length }} of {{ message.table!.totalRows | number }}</small></div>
+                <div *ngIf="message.sources.length" class="chat-sources"><button type="button" *ngFor="let source of message.sources" [disabled]="documentsLoaded && !hasDocument(source.documentId)" (click)="sourceOpened.emit(source.documentId)">{{ source.filename }} · {{ source.pageLabel || 'p. ' + source.pageNumber }}<span *ngIf="documentsLoaded && !hasDocument(source.documentId)"> · deleted</span></button></div>
                 <div *ngIf="message.context" class="answer-context"><span>Knowledge used</span><span *ngFor="let source of message.context.sources" [class]="'knowledge-chip kind-' + source.kind">{{ source.name }}</span></div>
                 <div *ngIf="message.debug" class="chat-trace"><button type="button" (click)="expandedTraceId = expandedTraceId === message.id ? null : message.id">{{ expandedTraceId === message.id ? 'Hide' : 'Show' }} developer trace</button><span>{{ message.mode }} route</span></div>
                 <section *ngIf="message.debug && expandedTraceId === message.id" class="developer-trace" aria-label="Developer trace"><div class="trace-header"><strong>Developer trace</strong><small>Local retrieval and final evidence path</small></div><div class="trace-overview"><div><small>Route</small><strong>{{ traceValue(message, 'route') }}</strong></div><div><small>Scope</small><strong>{{ traceValue(message, 'documentScope') }}</strong></div><div><small>Final evidence</small><strong>{{ traceValue(message, 'finalEvidenceIds') || traceValue(message, 'claudeValidatedCitationIds') || 'None' }}</strong></div></div><details open><summary>Structured facts</summary><pre>{{ traceValue(message, 'structuredFacts') | json }}</pre></details><details><summary>RAG retrieval</summary><pre>{{ traceValue(message, 'rag') | json }}</pre></details><details><summary>Complete trace</summary><pre>{{ message.debug | json }}</pre></details><p>Contains excerpts and financial data. Use only in a trusted environment.</p></section>
@@ -354,6 +363,7 @@ export class ChatComponent implements OnInit, OnChanges, OnDestroy {
   }
   onComposerKeydown(event: KeyboardEvent): void { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); this.send(); } }
   hasStreamingAssistant(): boolean { return this.messages.some(item => item.role === 'assistant' && item.status === 'streaming'); }
+  isNumeric(value: string): boolean { return /^-?[\d,]+(\.\d+)?$/.test(value); }
   traceValue(message: Message, key: string): unknown { return message.debug?.[key] ?? null; }
 
   async send(): Promise<void> {

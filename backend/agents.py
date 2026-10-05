@@ -45,6 +45,8 @@ CAPABILITIES = [
      "description": "Summarises a customer from the facts in their documents."},
     {"id": "consistency_check", "label": "Cross-document consistency check",
      "description": "Flags the same fact (name, date of birth, employer, income...) recorded differently across a customer's documents."},
+    {"id": "table_analysis", "label": "Analyse spreadsheets",
+     "description": "Counts, totals, averages, groupings and record lookups computed exactly over every row of CSV and Excel files."},
 ]
 CAPABILITY_IDS = {item["id"] for item in CAPABILITIES}
 CUSTOMER_ACCESS = {"required", "optional", "none"}
@@ -56,7 +58,7 @@ BUILTIN_AGENTS = [
         "description": "Works only inside the selected customer's own documents. Use it to find facts, get an overview of the customer, and spot values that disagree between documents.",
         "instructions": "Act as a meticulous document analyst. Report what the customer's documents state, quote exact values, and point out any disagreement between documents. Do not apply lending or compliance policy.",
         "customerAccess": "required", "spaceIds": [],
-        "capabilities": ["document_search", "fact_lookup", "calculations", "customer_profile", "consistency_check"],
+        "capabilities": ["document_search", "fact_lookup", "calculations", "customer_profile", "consistency_check", "table_analysis"],
     },
     {
         "id": "loan-eligibility-analyst", "name": "Loan Eligibility Analyst",
@@ -75,6 +77,15 @@ BUILTIN_AGENTS = [
         "capabilities": ["document_search", "fact_lookup", "customer_profile", "consistency_check"],
     },
 ]
+
+PORTFOLIO_AGENT = {
+    "id": "portfolio-data-analyst", "name": "Portfolio Data Analyst",
+    "purpose": "Answers operational questions from portfolio exports and trackers.",
+    "description": "Works on the CSV and Excel files in the Portfolio Data space. Counts, totals, breakdowns and record lookups are computed exactly over every row.",
+    "instructions": "Act as a banking operations analyst. Report exact figures with the filters and row counts they were computed from. Do not speculate about causes the data does not record.",
+    "customerAccess": "none", "spaceIds": ["portfolio-data"],
+    "capabilities": ["table_analysis", "document_search"],
+}
 
 CONSISTENCY_TERMS = re.compile(r"\b(inconsisten\w*|consistent|mismatch\w*|discrepan\w*|conflict\w*|contradict\w*|differ\w*|disagree\w*|match(?:es)?)\b", re.I)
 # Values that legitimately vary between documents are not flagged.
@@ -105,6 +116,27 @@ def initialise(connection: sqlite3.Connection) -> None:
                  agent["customerAccess"], json.dumps(agent["spaceIds"]), json.dumps(agent["capabilities"]), now, now),
             )
         connection.execute("INSERT INTO app_meta(key, value) VALUES ('agents_seeded_v1', ?)", (now,))
+    # Spreadsheet analysis release: enable it on the built-in customer analyst
+    # and add the portfolio agent. Seeded once, so later edits are respected.
+    if connection.execute("SELECT 1 FROM app_meta WHERE key='agents_seeded_v2'").fetchone() is None:
+        now = utc_now()
+        analyst = connection.execute("SELECT capabilities FROM agents WHERE id='customer-document-analyst'").fetchone()
+        if analyst is not None:
+            capabilities = json.loads(analyst["capabilities"] or "[]")
+            if "table_analysis" not in capabilities:
+                connection.execute(
+                    "UPDATE agents SET capabilities=?, updated_at=? WHERE id='customer-document-analyst'",
+                    (json.dumps([*capabilities, "table_analysis"]), now),
+                )
+        if connection.execute("SELECT 1 FROM knowledge_spaces WHERE id=?", (PORTFOLIO_AGENT["spaceIds"][0],)).fetchone() is not None:
+            agent = PORTFOLIO_AGENT
+            connection.execute(
+                """INSERT OR IGNORE INTO agents(id, name, purpose, description, instructions, model, customer_access,
+                space_ids, capabilities, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (agent["id"], agent["name"], agent["purpose"], agent["description"], agent["instructions"], DEFAULT_MODEL,
+                 agent["customerAccess"], json.dumps(agent["spaceIds"]), json.dumps(agent["capabilities"]), now, now),
+            )
+        connection.execute("INSERT INTO app_meta(key, value) VALUES ('agents_seeded_v2', ?)", (now,))
 
 
 def catalog() -> dict[str, Any]:
